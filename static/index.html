@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Visio - Live Accessibility Agent</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="header">
+        <h1><span>Visio</span> Accessibility Agent</h1>
+        <p>Real-time AI vision assistant for the visually impaired</p>
+      </header>
+
+      <div class="status-bar">
+        <div class="status-dot" id="statusDot"></div>
+        <span class="status-text" id="statusText">Ready to connect</span>
+      </div>
+
+      <div class="camera-section">
+        <video id="camera" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+        <div class="camera-overlay">
+          <span class="camera-badge">LIVE</span>
+        </div>
+      </div>
+
+      <div class="visualizer" id="visualizer">
+        <div class="visualizer-bar"></div>
+        <div class="visualizer-bar"></div>
+        <div class="visualizer-bar"></div>
+        <div class="visualizer-bar"></div>
+        <div class="visualizer-bar"></div>
+      </div>
+
+      <div class="controls">
+        <button class="btn btn-primary" id="startBtn">Start Visio</button>
+        <button class="btn btn-danger" id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div class="transcript-section" id="transcript">
+        <h2>Transcript</h2>
+        <div class="transcript-empty">
+          Press "Start Visio" to begin. Point your camera at your surroundings
+          and speak naturally.
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

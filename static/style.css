@@ -1,0 +1,295 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: #0a0a0f;
+  color: #e0e0e0;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/* Header */
+.header {
+  text-align: center;
+  padding: 20px 0;
+  border-bottom: 1px solid #1a1a2e;
+  margin-bottom: 24px;
+}
+
+.header h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: -0.5px;
+}
+
+.header h1 span {
+  color: #4ecdc4;
+}
+
+.header p {
+  color: #888;
+  font-size: 0.95rem;
+  margin-top: 4px;
+}
+
+/* Status Bar */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 20px;
+  background: #12121e;
+  border-radius: 12px;
+  margin-bottom: 20px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #555;
+  transition: background 0.3s;
+}
+
+.status-dot.connected {
+  background: #4ecdc4;
+  box-shadow: 0 0 8px #4ecdc466;
+}
+
+.status-dot.listening {
+  background: #f7b731;
+  animation: pulse 1.5s infinite;
+}
+
+.status-dot.speaking {
+  background: #4ecdc4;
+  animation: pulse 0.8s infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.status-text {
+  font-size: 0.9rem;
+  color: #aaa;
+}
+
+/* Camera Section */
+.camera-section {
+  position: relative;
+  margin-bottom: 20px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #111;
+  aspect-ratio: 4/3;
+}
+
+.camera-section video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.camera-section canvas {
+  display: none;
+}
+
+.camera-overlay {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.camera-badge {
+  background: #000000aa;
+  color: #4ecdc4;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* Controls */
+.controls {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  margin-bottom: 24px;
+}
+
+.btn {
+  padding: 14px 32px;
+  border: none;
+  border-radius: 12px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-primary {
+  background: #4ecdc4;
+  color: #0a0a0f;
+}
+
+.btn-primary:hover {
+  background: #45b7b0;
+  transform: translateY(-1px);
+}
+
+.btn-primary:disabled {
+  background: #2a2a3a;
+  color: #555;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-danger {
+  background: #ff6b6b;
+  color: #fff;
+}
+
+.btn-danger:hover {
+  background: #ee5a5a;
+}
+
+/* Transcript */
+.transcript-section {
+  background: #12121e;
+  border-radius: 16px;
+  padding: 20px;
+  min-height: 200px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.transcript-section h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #666;
+  margin-bottom: 12px;
+}
+
+.transcript-entry {
+  padding: 8px 0;
+  border-bottom: 1px solid #1a1a2e;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.transcript-entry:last-child {
+  border-bottom: none;
+}
+
+.transcript-entry.agent {
+  color: #4ecdc4;
+}
+
+.transcript-entry.user {
+  color: #f7b731;
+}
+
+.transcript-empty {
+  color: #444;
+  text-align: center;
+  padding: 40px 0;
+  font-size: 0.95rem;
+}
+
+/* Audio Visualizer */
+.visualizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: 30px;
+  margin-bottom: 20px;
+}
+
+.visualizer-bar {
+  width: 4px;
+  height: 4px;
+  background: #4ecdc4;
+  border-radius: 2px;
+  transition: height 0.1s;
+}
+
+.visualizer.active .visualizer-bar {
+  animation: visualize 0.5s ease-in-out infinite alternate;
+}
+
+.visualizer.active .visualizer-bar:nth-child(1) {
+  animation-delay: 0s;
+}
+.visualizer.active .visualizer-bar:nth-child(2) {
+  animation-delay: 0.1s;
+}
+.visualizer.active .visualizer-bar:nth-child(3) {
+  animation-delay: 0.2s;
+}
+.visualizer.active .visualizer-bar:nth-child(4) {
+  animation-delay: 0.15s;
+}
+.visualizer.active .visualizer-bar:nth-child(5) {
+  animation-delay: 0.05s;
+}
+
+@keyframes visualize {
+  from {
+    height: 4px;
+  }
+  to {
+    height: 24px;
+  }
+}
+
+/* Scrollbar */
+.transcript-section::-webkit-scrollbar {
+  width: 6px;
+}
+.transcript-section::-webkit-scrollbar-track {
+  background: transparent;
+}
+.transcript-section::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 3px;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .container {
+    padding: 12px;
+  }
+  .header h1 {
+    font-size: 1.5rem;
+  }
+  .btn {
+    padding: 12px 24px;
+    font-size: 0.9rem;
+  }
+}
