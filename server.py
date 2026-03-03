@@ -113,6 +113,22 @@ async def websocket_endpoint(websocket: WebSocket):
                                 parts=[types.Part(text=data["data"])]
                             )
                             live_request_queue.send_content(content)
+
+                        elif msg_type == "mode":
+                            mode = data.get("data", "navigation")
+                            logger.info(f"Mode switched to: {mode}")
+                            content = types.Content(
+                                parts=[types.Part(text=f"[MODE SWITCH: {mode.upper()}] Adjust your behavior to {mode} mode accordingly.")]
+                            )
+                            live_request_queue.send_content(content)
+
+                        elif msg_type == "language":
+                            lang = data.get("data", "English")
+                            logger.info(f"Language switched to: {lang}")
+                            content = types.Content(
+                                parts=[types.Part(text=f"[LANGUAGE: {lang}] Respond in {lang} from now on. Translate any text you see into {lang}.")]
+                            )
+                            live_request_queue.send_content(content)
                     except Exception as e:
                         logger.error(f"Parse error: {e}")
 
