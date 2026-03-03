@@ -16,17 +16,63 @@
       <div class="status-bar">
         <div class="status-dot" id="statusDot"></div>
         <span class="status-text" id="statusText">Ready to connect</span>
+        <div class="connection-quality" id="connectionQuality" aria-label="Connection quality">
+          <div class="quality-dot"></div>
+          <div class="quality-dot"></div>
+          <div class="quality-dot"></div>
+        </div>
       </div>
 
-      <div class="camera-section">
+      <!-- Hazard Alert Banner -->
+      <div class="hazard-banner" id="hazardBanner" role="alert" aria-live="assertive" aria-atomic="true">
+        <span class="hazard-icon">&#9888;</span>
+        <span class="hazard-text" id="hazardText"></span>
+      </div>
+
+      <div class="camera-section" id="cameraSection">
         <video id="camera" autoplay playsinline muted></video>
         <canvas id="canvas"></canvas>
         <div class="camera-overlay">
           <span class="camera-badge">LIVE</span>
+          <span class="mode-badge" id="modeBadge">NAVIGATION</span>
         </div>
       </div>
 
-      <div class="visualizer" id="visualizer">
+      <!-- Orientation Guidance -->
+      <div class="orientation-bar" id="orientationBar" role="status" aria-live="polite">
+        <span class="orientation-icon" id="orientationIcon">&#128241;</span>
+        <span class="orientation-text" id="orientationText">Phone position: Good</span>
+      </div>
+
+      <!-- Mode Switcher -->
+      <div class="mode-switcher" role="tablist" aria-label="Assistant mode">
+        <button class="mode-btn active" data-mode="navigation" role="tab" aria-selected="true" aria-label="Navigation mode - hazard detection and directions">
+          <span class="mode-icon">&#129517;</span> Navigate
+        </button>
+        <button class="mode-btn" data-mode="reading" role="tab" aria-selected="false" aria-label="Reading mode - text and sign reading">
+          <span class="mode-icon">&#128214;</span> Read
+        </button>
+        <button class="mode-btn" data-mode="exploration" role="tab" aria-selected="false" aria-label="Exploration mode - detailed scene descriptions">
+          <span class="mode-icon">&#128269;</span> Explore
+        </button>
+      </div>
+
+      <!-- Language Selector -->
+      <div class="language-bar">
+        <label for="langSelect" class="lang-label">Language:</label>
+        <select id="langSelect" class="lang-select" aria-label="Response language">
+          <option value="English" selected>English</option>
+          <option value="Hindi">Hindi</option>
+          <option value="Spanish">Spanish</option>
+          <option value="Arabic">Arabic</option>
+          <option value="Mandarin">Mandarin</option>
+          <option value="French">French</option>
+          <option value="Japanese">Japanese</option>
+          <option value="Korean">Korean</option>
+        </select>
+      </div>
+
+      <div class="visualizer" id="visualizer" aria-hidden="true">
         <div class="visualizer-bar"></div>
         <div class="visualizer-bar"></div>
         <div class="visualizer-bar"></div>
@@ -35,11 +81,11 @@
       </div>
 
       <div class="controls">
-        <button class="btn btn-primary" id="startBtn">Start Visio</button>
-        <button class="btn btn-danger" id="stopBtn" disabled>Stop</button>
+        <button class="btn btn-primary" id="startBtn" aria-label="Start Visio accessibility agent">Start Visio</button>
+        <button class="btn btn-danger" id="stopBtn" disabled aria-label="Stop Visio">Stop</button>
       </div>
 
-      <div class="transcript-section" id="transcript">
+      <div class="transcript-section" id="transcript" aria-label="Conversation transcript" aria-live="polite">
         <h2>Transcript</h2>
         <div class="transcript-empty">
           Press "Start Visio" to begin. Point your camera at your surroundings
