@@ -1,18 +1,17 @@
 const AUDIO_SAMPLE_RATE = 16000;
 const PLAYBACK_SAMPLE_RATE = 24000;
 const VIDEO_FRAME_INTERVAL = 2000;
-const VIDEO_WIDTH = 320;
-const VIDEO_HEIGHT = 240;
-const VIDEO_QUALITY = 0.4;
+const VIDEO_SIZE = 768;
+const VIDEO_QUALITY = 0.5;
 
 let ws = null;
 let audioContext = null;
 let playbackContext = null;
+let playerNode = null;
 let mediaStream = null;
 let audioWorklet = null;
 let videoTimer = null;
 let isRunning = false;
-let nextPlayTime = 0;
 
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
@@ -31,7 +30,6 @@ function setStatus(state, text) {
 function addTranscript(text, type) {
   const empty = transcript.querySelector(".transcript-empty");
   if (empty) empty.remove();
-
   const entry = document.createElement("div");
   entry.className = "transcript-entry " + type;
   entry.textContent = (type === "agent" ? "Visio: " : "You: ") + text;
@@ -53,15 +51,30 @@ async function startSession() {
       },
       video: {
         facingMode: "environment",
-        width: { ideal: VIDEO_WIDTH },
-        height: { ideal: VIDEO_HEIGHT },
+        width: { ideal: VIDEO_SIZE },
+        height: { ideal: VIDEO_SIZE },
       },
     });
 
     video.srcObject = mediaStream;
 
+    // Setup audio playback with ring buffer
+    playbackContext = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+    await playbackContext.audioWorklet.addModule("/static/audio-player.js");
+    playerNode = new AudioWorkletNode(playbackContext, "pcm-player-processor");
+    playerNode.connect(playbackContext.destination);
+    playerNode.port.onmessage = (e) => {
+      if (e.data.type === "ended") {
+        visualizer.classList.remove("active");
+        setStatus("listening", "Listening...");
+      }
+    };
+
+    setStatus("", "Connecting...");
+
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${protocol}//${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
       isRunning = true;
@@ -73,21 +86,22 @@ async function startSession() {
     };
 
     ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-
-      if (msg.type === "audio") {
-        const audioBytes = base64ToArrayBuffer(msg.data);
-        scheduleAudio(audioBytes);
+      if (event.data instanceof ArrayBuffer) {
+        // Binary audio from agent — feed to ring buffer player
+        playerNode.port.postMessage(event.data);
         setStatus("speaking", "Visio is speaking...");
         visualizer.classList.add("active");
-      }
-
-      if (msg.type === "text") {
-        addTranscript(msg.data, "agent");
-      }
-
-      if (msg.type === "error") {
-        setStatus("", "Error: " + msg.data);
+      } else {
+        // Text JSON message
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "transcript") {
+            addTranscript(msg.data, "agent");
+          }
+        } catch (e) {
+          // Plain text
+          addTranscript(event.data, "agent");
+        }
       }
     };
 
@@ -97,13 +111,9 @@ async function startSession() {
         stopSession();
       }
     };
-
-    ws.onerror = () => {
-      setStatus("", "Connection error");
-    };
+    ws.onerror = () => setStatus("", "Connection error");
   } catch (err) {
     setStatus("", "Error: " + err.message);
-    console.error("Start error:", err);
   }
 }
 
@@ -116,10 +126,8 @@ async function startAudioCapture() {
 
   audioWorklet.port.onmessage = (event) => {
     if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-    const pcmData = new Uint8Array(event.data);
-    const base64 = arrayBufferToBase64(pcmData);
-    ws.send(JSON.stringify({ type: "audio", data: base64 }));
+    // Send raw binary audio — no JSON wrapping
+    ws.send(event.data);
   };
 
   source.connect(audioWorklet);
@@ -127,107 +135,44 @@ async function startAudioCapture() {
 
 function startVideoCapture() {
   const ctx = canvas.getContext("2d");
-  canvas.width = VIDEO_WIDTH;
-  canvas.height = VIDEO_HEIGHT;
+  canvas.width = VIDEO_SIZE;
+  canvas.height = VIDEO_SIZE;
 
   videoTimer = setInterval(() => {
     if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-    ctx.drawImage(video, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
-    const dataUrl = canvas.toDataURL("image/jpeg", VIDEO_QUALITY);
-    const base64 = dataUrl.split(",")[1];
-    ws.send(JSON.stringify({ type: "video", data: base64 }));
+    ctx.drawImage(video, 0, 0, VIDEO_SIZE, VIDEO_SIZE);
+
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64 = reader.result.split(",")[1];
+          ws.send(JSON.stringify({ type: "image", data: base64 }));
+        };
+        reader.readAsDataURL(blob);
+      },
+      "image/jpeg",
+      VIDEO_QUALITY
+    );
   }, VIDEO_FRAME_INTERVAL);
-}
-
-function scheduleAudio(pcmArrayBuffer) {
-  if (!playbackContext) {
-    playbackContext = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
-    nextPlayTime = 0;
-  }
-
-  const int16 = new Int16Array(pcmArrayBuffer);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768.0;
-  }
-
-  const buffer = playbackContext.createBuffer(
-    1,
-    float32.length,
-    PLAYBACK_SAMPLE_RATE
-  );
-  buffer.getChannelData(0).set(float32);
-
-  const source = playbackContext.createBufferSource();
-  source.buffer = buffer;
-  source.connect(playbackContext.destination);
-
-  const now = playbackContext.currentTime;
-  const startTime = Math.max(now, nextPlayTime);
-  source.start(startTime);
-  nextPlayTime = startTime + buffer.duration;
-
-  source.onended = () => {
-    if (playbackContext && playbackContext.currentTime >= nextPlayTime - 0.05) {
-      visualizer.classList.remove("active");
-      setStatus("listening", "Listening...");
-    }
-  };
 }
 
 function stopSession() {
   isRunning = false;
-
-  if (videoTimer) {
-    clearInterval(videoTimer);
-    videoTimer = null;
-  }
-  if (audioWorklet) {
-    audioWorklet.disconnect();
-    audioWorklet = null;
-  }
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-  }
-  if (playbackContext) {
-    playbackContext.close();
-    playbackContext = null;
-  }
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((t) => t.stop());
-    mediaStream = null;
-  }
-  if (ws) {
-    ws.close();
-    ws = null;
-  }
-
+  if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+  if (audioWorklet) { audioWorklet.disconnect(); audioWorklet = null; }
+  if (audioContext) { audioContext.close(); audioContext = null; }
+  if (playerNode) { playerNode.port.postMessage({ command: "stop" }); }
+  if (playbackContext) { playbackContext.close(); playbackContext = null; playerNode = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+  if (ws) { ws.close(); ws = null; }
   video.srcObject = null;
-  nextPlayTime = 0;
   visualizer.classList.remove("active");
   setStatus("", "Disconnected");
   startBtn.disabled = false;
   stopBtn.disabled = true;
-}
-
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToArrayBuffer(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
 }
 
 startBtn.addEventListener("click", startSession);
