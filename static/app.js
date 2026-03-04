@@ -671,6 +671,11 @@ function handleWsMessage(event) {
       } else if (msg.type === "user_transcript") {
         addTranscript(msg.data, "user");
         checkForEmergencyKeyword(msg.data);
+        // Signal server that user is speaking — pauses nav prompts
+        lastUserSpeechTime = Date.now();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "user_speech" }));
+        }
       }
     } catch (e) {
       addTranscript(event.data, "agent");

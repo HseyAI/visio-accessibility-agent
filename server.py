@@ -140,9 +140,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     live_request_queue = LiveRequestQueue()
     running = True
+    last_user_speech_time = 0.0  # Track when user last spoke
 
     async def upstream():
-        nonlocal running
+        nonlocal running, last_user_speech_time
         try:
             while running:
                 msg = await websocket.receive()
@@ -177,11 +178,29 @@ async def websocket_endpoint(websocket: WebSocket):
                                 mime_type="image/jpeg",
                                 data=image_bytes,
                             )
-                            # Stream frames silently — proactive_audio lets model
-                            # decide when to speak based on what it sees.
-                            # NO send_content() prompts — they force responses,
-                            # queue up, cause latency, and override user voice.
+                            frame_num = data.get("frame", 0)
+                            mode = session_stats.get("current_mode", "navigation")
+
+                            # Always stream frames — model accumulates visual context
                             live_request_queue.send_realtime(image_blob)
+
+                            # NAVIGATION ONLY: prompt every 5th frame (~5s) to
+                            # trigger obstacle detection. Skip if user spoke
+                            # recently (let model answer their question first).
+                            if mode == "navigation" and frame_num > 0 and frame_num % 5 == 0:
+                                now = time.time()
+                                if now - last_user_speech_time > 3.0:
+                                    live_request_queue.send_content(
+                                        types.Content(parts=[types.Part(
+                                            text="[NAV] Check the path. Warn if obstacle/hazard, otherwise stay silent."
+                                        )])
+                                    )
+                            # Reading/Exploration: NO periodic prompts.
+                            # User drives interaction via voice. Model responds.
+
+                        elif msg_type == "user_speech":
+                            # Client signals user is speaking — pause nav prompts
+                            last_user_speech_time = time.time()
 
                         elif msg_type == "text":
                             text_data = data["data"]
