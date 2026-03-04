@@ -173,7 +173,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                         f"If path is genuinely clear → brief confirmation."
                                     )
                                 elif mode == "reading":
-                                    prompt_text = f"[FRAME {frame_num}] Read any visible text or signs."
+                                    prompt_text = f"[FRAME {frame_num}] READING MODE — Focus ONLY on text. What text, words, or writing is visible? Read it out. Ignore everything else in the scene."
                                 else:
                                     prompt_text = f"[FRAME {frame_num}] Describe what's around the user."
                                 context = types.Content(
@@ -197,8 +197,14 @@ async def websocket_endpoint(websocket: WebSocket):
                             session_stats["mode_switches"] += 1
                             session_stats["current_mode"] = mode
                             logger.info(f"Mode switched to: {mode}")
+                            if mode == "navigation":
+                                switch_text = "[MODE SWITCH: NAVIGATION] You are now in navigation mode. Focus ONLY on path safety, obstacles, and directions. Keep responses short."
+                            elif mode == "reading":
+                                switch_text = "[MODE SWITCH: READING] You are now in reading mode. Focus ONLY on reading text visible in the image — books, signs, labels, screens, documents. Do NOT describe the scene or surroundings. ONLY read text. If you see a book cover, identify it and tell the user about it."
+                            else:
+                                switch_text = "[MODE SWITCH: EXPLORATION] You are now in exploration mode. Give a detailed description of the full scene — layout, objects, spatial relationships."
                             content = types.Content(
-                                parts=[types.Part(text=f"[MODE SWITCH: {mode.upper()}] Adjust your behavior to {mode} mode accordingly.")]
+                                parts=[types.Part(text=switch_text)]
                             )
                             live_request_queue.send_content(content)
 
