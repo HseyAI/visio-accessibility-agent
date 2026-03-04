@@ -52,6 +52,88 @@ except Exception:
 
 APP_NAME = "visio-agent"
 
+# ---------------------------------------------------------------------------
+# Object Memory — track obstacles across frames per session
+# ---------------------------------------------------------------------------
+# Obstacle keywords the model might mention in responses
+OBSTACLE_KEYWORDS = [
+    "car", "vehicle", "motorcycle", "bike", "bicycle", "scooter", "bus", "truck",
+    "person", "pedestrian", "child", "dog", "animal",
+    "chair", "table", "bench", "pole", "post", "sign", "tree", "branch",
+    "wall", "fence", "barrier", "bollard", "cone", "construction",
+    "stairs", "steps", "curb", "pothole", "hole", "crack",
+    "door", "gate", "pillar", "column", "box", "bin", "trash",
+]
+
+def create_object_memory():
+    """Create a fresh object memory dict for a session."""
+    return {
+        "last_obstacles": [],        # [{name, side, frame_num, timestamp}]
+        "last_clear_frame": 0,       # frame when scene was last fully clear
+        "consecutive_clear": 0,      # count of consecutive clear responses
+    }
+
+def parse_obstacles_from_text(text, frame_num):
+    """Extract obstacle mentions from model response text."""
+    lower = text.lower()
+    found = []
+    for kw in OBSTACLE_KEYWORDS:
+        if kw in lower:
+            # Determine side from text
+            side = "ahead"
+            if "left" in lower:
+                side = "left"
+            elif "right" in lower:
+                side = "right"
+            found.append({
+                "name": kw,
+                "side": side,
+                "frame_num": frame_num,
+                "timestamp": time.time(),
+            })
+    return found
+
+def check_obstacle_memory(obj_memory, model_text, frame_num):
+    """
+    Check if model says 'clear' but we recently tracked close obstacles.
+    Returns a caution message or None.
+    """
+    lower = model_text.lower()
+
+    # Parse any new obstacles from model response
+    new_obstacles = parse_obstacles_from_text(model_text, frame_num)
+    if new_obstacles:
+        obj_memory["last_obstacles"] = new_obstacles
+        obj_memory["consecutive_clear"] = 0
+        return None
+
+    # Check if model is saying it's clear
+    clear_phrases = ["clear", "no obstacle", "path is free", "nothing ahead", "all clear", "safe to"]
+    is_clear = any(phrase in lower for phrase in clear_phrases)
+
+    if not is_clear:
+        return None
+
+    # Model says clear — check memory for recent obstacles
+    now = time.time()
+    obj_memory["consecutive_clear"] += 1
+
+    # Only inject caution if obstacles were seen recently (<5s) and fewer than 5 consecutive clears
+    recent = [o for o in obj_memory["last_obstacles"] if now - o["timestamp"] < 5.0]
+
+    if recent and obj_memory["consecutive_clear"] < 5:
+        names = list(set(o["name"] for o in recent))
+        sides = list(set(o["side"] for o in recent))
+        age = round(now - recent[0]["timestamp"], 1)
+        caution = f"[CAUTION] You were approaching {', '.join(names)} on your {sides[0]} {age}s ago. It may still be near you. Proceed carefully."
+        return caution
+
+    # After 5 consecutive clears, trust the model and flush memory
+    if obj_memory["consecutive_clear"] >= 5:
+        obj_memory["last_obstacles"] = []
+
+    return None
+
 from visio_agent.agent import root_agent
 
 session_service = InMemorySessionService()
@@ -111,6 +193,10 @@ async def websocket_endpoint(websocket: WebSocket):
         session_id=session_id,
     )
 
+    # Object memory for obstacle persistence
+    obj_memory = create_object_memory()
+    last_frame_num = 0  # Track latest frame for obstacle memory
+
     run_config = RunConfig(
         streaming_mode=StreamingMode.BIDI,
         response_modalities=["AUDIO"],
@@ -143,7 +229,7 @@ async def websocket_endpoint(websocket: WebSocket):
     last_user_speech_time = 0.0  # Track when user last spoke
 
     async def upstream():
-        nonlocal running, last_user_speech_time
+        nonlocal running, last_user_speech_time, last_frame_num
         try:
             while running:
                 msg = await websocket.receive()
@@ -179,40 +265,28 @@ async def websocket_endpoint(websocket: WebSocket):
                                 data=image_bytes,
                             )
                             frame_num = data.get("frame", 0)
-                            mode = session_stats.get("current_mode", "navigation")
+                            last_frame_num = frame_num
                             sensors = data.get("sensors")
 
                             # Always stream frames — model accumulates visual context
                             live_request_queue.send_realtime(image_blob)
 
-                            # NAVIGATION ONLY: prompt every 3rd frame (~3s) for
-                            # responsive obstacle detection. Skip if user spoke
-                            # recently (let model answer their question first).
-                            if mode == "navigation" and frame_num > 0 and frame_num % 3 == 0:
-                                now = time.time()
-                                if now - last_user_speech_time > 3.0:
-                                    # Build sensor context string
-                                    sensor_ctx = ""
-                                    if sensors:
-                                        parts_list = []
-                                        if sensors.get("heading") is not None:
-                                            parts_list.append(f"compass {sensors['heading']}°")
-                                        if sensors.get("turn") and sensors["turn"] != "steady":
-                                            parts_list.append(f"user {sensors['turn']}")
-                                        if sensors.get("lean") is not None:
-                                            lean = sensors["lean"]
-                                            if abs(lean) > 10:
-                                                parts_list.append(f"phone tilted {'right' if lean > 0 else 'left'} {abs(lean)}°")
-                                        if parts_list:
-                                            sensor_ctx = " | Sensors: " + ", ".join(parts_list)
-
-                                    live_request_queue.send_content(
-                                        types.Content(parts=[types.Part(
-                                            text=f"[NAV] Live path check{sensor_ctx}. Obstacles? Give direction relative to USER (image-left=user-left). Silent if clear."
-                                        )])
-                                    )
-                            # Reading/Exploration: NO periodic prompts.
-                            # User drives interaction via voice. Model responds.
+                            # NO periodic nav prompts — proactive_audio handles it.
+                            # Only send proximity alerts when client detects close obstacles.
+                            if sensors and sensors.get("proximity") in ("close",):
+                                ground = sensors.get("ground_obstructed", False)
+                                center = sensors.get("center_blocked", False)
+                                hints = []
+                                if ground:
+                                    hints.append("ground obstruction detected")
+                                if center:
+                                    hints.append("large object in center of frame")
+                                hint_str = " — ".join(hints) if hints else "obstacle very close"
+                                live_request_queue.send_content(
+                                    types.Content(parts=[types.Part(
+                                        text=f"[PROXIMITY ALERT] Sensors detect: {hint_str}. Check the scene and warn the user immediately if there's danger."
+                                    )])
+                                )
 
                         elif msg_type == "user_speech":
                             # Client signals user is speaking — pause nav prompts
@@ -296,6 +370,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_text(
                                 json.dumps({"type": msg_type, "data": part.text})
                             )
+
+                            # Object memory — track obstacles in model responses
+                            if not is_user:
+                                caution = check_obstacle_memory(obj_memory, part.text, last_frame_num)
+                                if caution:
+                                    # Inject caution back to model so it relays to user
+                                    live_request_queue.send_content(
+                                        types.Content(parts=[types.Part(text=caution)])
+                                    )
                     except Exception:
                         pass
 

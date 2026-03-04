@@ -54,9 +54,9 @@ gcloud run deploy "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
   --allow-unauthenticated \
   --set-env-vars "GOOGLE_API_KEY=${GOOGLE_API_KEY},GOOGLE_GENAI_USE_VERTEXAI=FALSE" \
-  --memory 512Mi \
-  --cpu 1 \
-  --timeout 300 \
+  --memory 1Gi \
+  --cpu 2 \
+  --timeout 3600 \
   --concurrency 10 \
   --quiet
 
