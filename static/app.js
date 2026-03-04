@@ -541,6 +541,10 @@ async function startSession() {
 
     // Setup audio playback with ring buffer
     playbackContext = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+    // Resume AudioContext — mobile browsers suspend it until user gesture
+    if (playbackContext.state === "suspended") {
+      await playbackContext.resume();
+    }
     await playbackContext.audioWorklet.addModule("/static/audio-player.js");
     playerNode = new AudioWorkletNode(playbackContext, "pcm-player-processor");
     pannerNode = playbackContext.createStereoPanner();
@@ -649,6 +653,10 @@ function reconnectWebSocket() {
 
 function handleWsMessage(event) {
   if (event.data instanceof ArrayBuffer) {
+    // Ensure audio context is running (mobile browsers can suspend it)
+    if (playbackContext && playbackContext.state === "suspended") {
+      playbackContext.resume();
+    }
     if (playerNode) playerNode.port.postMessage(event.data);
     setStatus("speaking", "Visio is speaking...");
     visualizer.classList.add("active");
