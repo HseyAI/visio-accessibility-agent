@@ -184,15 +184,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             # Always stream frames — model accumulates visual context
                             live_request_queue.send_realtime(image_blob)
 
-                            # NAVIGATION ONLY: prompt every 5th frame (~5s) to
-                            # trigger obstacle detection. Skip if user spoke
+                            # NAVIGATION ONLY: prompt every 3rd frame (~3s) for
+                            # responsive obstacle detection. Skip if user spoke
                             # recently (let model answer their question first).
-                            if mode == "navigation" and frame_num > 0 and frame_num % 5 == 0:
+                            if mode == "navigation" and frame_num > 0 and frame_num % 3 == 0:
                                 now = time.time()
                                 if now - last_user_speech_time > 3.0:
                                     live_request_queue.send_content(
                                         types.Content(parts=[types.Part(
-                                            text="[NAV] Check the path. Warn if obstacle/hazard, otherwise stay silent."
+                                            text="[NAV] Live check — anything in the path? Warn with correct direction (image left=user's left). Stay silent if clear."
                                         )])
                                     )
                             # Reading/Exploration: NO periodic prompts.
