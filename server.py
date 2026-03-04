@@ -160,10 +160,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             # Send frame context prompt every 3rd frame
                             frame_num = data.get("frame", 0)
                             mode = session_stats.get("current_mode", "navigation")
-                            prompt_interval = 3 if mode == "navigation" else 5
+                            prompt_interval = 4 if mode == "navigation" else 6
                             if frame_num > 0 and frame_num % prompt_interval == 0:
                                 if mode == "navigation":
-                                    prompt_text = f"[FRAME {frame_num}] Briefly: any NEW hazards, obstacles, or important changes? If nothing new, stay silent."
+                                    prompt_text = f"[FRAME {frame_num}] Quick update: any hazards or changes? If nothing new, just confirm path is clear."
                                 elif mode == "reading":
                                     prompt_text = f"[FRAME {frame_num}] Any text or signs visible? Read them if new."
                                 else:
