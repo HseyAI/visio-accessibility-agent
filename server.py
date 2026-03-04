@@ -116,6 +116,24 @@ async def websocket_endpoint(websocket: WebSocket):
         response_modalities=["AUDIO"],
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
+        # Unlimited session duration — prevents hallucination after 2min
+        context_window_compression=types.ContextWindowCompressionConfig(
+            trigger_tokens=80000,
+            sliding_window=types.SlidingWindow(target_tokens=60000),
+        ),
+        # Auto-reconnect on WebSocket ~10min timeout
+        session_resumption=types.SessionResumptionConfig(),
+        # Model decides when to speak vs stay silent
+        proactivity=types.ProactivityConfig(proactive_audio=True),
+        # VAD: less sensitive to background noise
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=False,
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                silence_duration_ms=300,
+            ),
+        ),
     )
 
     live_request_queue = LiveRequestQueue()
@@ -160,27 +178,23 @@ async def websocket_endpoint(websocket: WebSocket):
                             frame_num = data.get("frame", 0)
                             mode = session_stats.get("current_mode", "navigation")
 
-                            # Navigation: prompt every 3rd frame (~2.4s) focused on PATH SAFETY
-                            # Other modes: every 5th frame
-                            prompt_interval = 3 if mode == "navigation" else 5
+                            # Stream ALL frames silently — model accumulates context
+                            live_request_queue.send_realtime(image_blob)
+
+                            # Only prompt periodically — short prompts to avoid token waste
+                            # Navigation: every 5th frame (~5s), Reading/Explore: every 8th frame (~16s)
+                            prompt_interval = 5 if mode == "navigation" else 8
                             if frame_num > 0 and frame_num % prompt_interval == 0:
                                 if mode == "navigation":
-                                    prompt_text = (
-                                        f"[FRAME {frame_num}] SCAN THE PATH: "
-                                        f"Is there ANYTHING in the user's walking path? "
-                                        f"Vehicles, steps, obstacles, people, walls? "
-                                        f"If yes → warn immediately with direction to avoid. "
-                                        f"If path is genuinely clear → brief confirmation."
-                                    )
+                                    prompt_text = "[NAV] What's in the path? Warn if obstacle, else confirm clear."
                                 elif mode == "reading":
-                                    prompt_text = f"[FRAME {frame_num}] READING MODE — Focus ONLY on text. What text, words, or writing is visible? Read it out. Ignore everything else in the scene."
+                                    prompt_text = "[READ] What text is visible? Acknowledge briefly — wait for user to ask for details."
                                 else:
-                                    prompt_text = f"[FRAME {frame_num}] Describe what's around the user."
+                                    prompt_text = "[EXPLORE] Brief scene update — only mention changes from last update."
                                 context = types.Content(
                                     parts=[types.Part(text=prompt_text)]
                                 )
                                 live_request_queue.send_content(context)
-                            live_request_queue.send_realtime(image_blob)
 
                         elif msg_type == "text":
                             text_data = data["data"]
@@ -198,11 +212,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             session_stats["current_mode"] = mode
                             logger.info(f"Mode switched to: {mode}")
                             if mode == "navigation":
-                                switch_text = "[MODE SWITCH: NAVIGATION] You are now in navigation mode. Focus ONLY on path safety, obstacles, and directions. Keep responses short."
+                                switch_text = "[MODE: NAVIGATION] Focus on path safety. Warn about obstacles with direction to avoid."
                             elif mode == "reading":
-                                switch_text = "[MODE SWITCH: READING] You are now in reading mode. Focus ONLY on reading text visible in the image — books, signs, labels, screens, documents. Do NOT describe the scene or surroundings. ONLY read text. If you see a book cover, identify it and tell the user about it."
+                                switch_text = "[MODE: READING] Acknowledge visible text, then wait for user to ask before reading."
                             else:
-                                switch_text = "[MODE SWITCH: EXPLORATION] You are now in exploration mode. Give a detailed description of the full scene — layout, objects, spatial relationships."
+                                switch_text = "[MODE: EXPLORATION] Describe surroundings when asked. Answer user's questions."
                             content = types.Content(
                                 parts=[types.Part(text=switch_text)]
                             )

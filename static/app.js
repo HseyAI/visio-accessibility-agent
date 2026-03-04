@@ -3,14 +3,14 @@
 // ---------------------------------------------------------------------------
 const AUDIO_SAMPLE_RATE = 16000;
 const PLAYBACK_SAMPLE_RATE = 24000;
-const VIDEO_SIZE = 512;
-const VIDEO_QUALITY = 0.7;    // Higher quality for better obstacle detection
+const VIDEO_SIZE = 768;        // Google recommended — better obstacle detection
+const VIDEO_QUALITY = 0.5;     // 768px at 0.5 ≈ same bandwidth as 512 at 0.7
 
 // Mode-specific frame intervals (ms)
 const MODE_FRAME_INTERVALS = {
-  navigation: 600,    // Very fast — obstacle detection is life-critical
+  navigation: 1000,   // 1 FPS — Google recommended, ~258 tokens/frame
   reading: 2000,      // Slower — text doesn't move
-  exploration: 1200,  // Medium — need scene detail
+  exploration: 2000,  // Save tokens for longer sessions
 };
 
 let VIDEO_FRAME_INTERVAL = MODE_FRAME_INTERVALS.navigation;
