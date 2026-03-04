@@ -3,14 +3,14 @@
 // ---------------------------------------------------------------------------
 const AUDIO_SAMPLE_RATE = 16000;
 const PLAYBACK_SAMPLE_RATE = 24000;
-const VIDEO_SIZE = 512;       // Smaller = faster upload, Gemini doesn't need 768
-const VIDEO_QUALITY = 0.65;   // Higher quality = fewer misidentifications
+const VIDEO_SIZE = 512;
+const VIDEO_QUALITY = 0.7;    // Higher quality for better obstacle detection
 
 // Mode-specific frame intervals (ms)
 const MODE_FRAME_INTERVALS = {
-  navigation: 800,    // Fast — hazard detection priority, user is moving
-  reading: 2500,      // Slower — text doesn't move
-  exploration: 1500,  // Medium — need detail but scene changes
+  navigation: 600,    // Very fast — obstacle detection is life-critical
+  reading: 2000,      // Slower — text doesn't move
+  exploration: 1200,  // Medium — need scene detail
 };
 
 let VIDEO_FRAME_INTERVAL = MODE_FRAME_INTERVALS.navigation;
@@ -51,6 +51,7 @@ let reconnectAttempts = 0;
 let reconnectTimer = null;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY = 1000; // ms, doubles each attempt
+let lastUserSpeechTime = 0;        // Track when user last spoke
 
 // Orientation state
 let orientationBad = false;
