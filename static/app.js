@@ -53,6 +53,11 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY = 1000; // ms, doubles each attempt
 let lastUserSpeechTime = 0;        // Track when user last spoke
 
+// Frame diff state
+let previousFrameData = null;
+let framesSkipped = 0;
+const DIFF_THRESHOLD = 8; // RMS pixel difference threshold
+
 // Orientation state
 let orientationBad = false;
 let orientationWarningActive = false;
@@ -244,7 +249,7 @@ function classifyOrientation(beta, gamma, readings) {
     if (beta > 130) {
       return { bad: true, message: "Raise your phone up", icon: "\u2B06\uFE0F" };
     }
-    if (beta < 40) {
+    if (beta < 20) {
       return { bad: true, message: "Lower your phone", icon: "\u2B07\uFE0F" };
     }
   }
@@ -738,6 +743,78 @@ async function startAudioCapture() {
   source.connect(audioWorklet);
 }
 
+// ---------------------------------------------------------------------------
+// Frame Diff — skip sending when scene hasn't changed
+// ---------------------------------------------------------------------------
+function hasFrameChanged(ctx) {
+  var current = ctx.getImageData(0, 0, VIDEO_SIZE, VIDEO_SIZE);
+  if (!previousFrameData) {
+    previousFrameData = current.data.slice();
+    return true;
+  }
+  var diff = 0;
+  var samples = 0;
+  // Sample every 16th pixel (every 64th byte — RGBA) for speed
+  for (var i = 0; i < current.data.length; i += 64) {
+    diff += Math.abs(current.data[i] - previousFrameData[i]);
+    samples++;
+  }
+  var rms = diff / samples;
+  previousFrameData = current.data.slice();
+  return rms > DIFF_THRESHOLD;
+}
+
+// ---------------------------------------------------------------------------
+// Proximity Estimation — analyze frame regions for nearby obstacles
+// ---------------------------------------------------------------------------
+function estimateProximity(ctx) {
+  var imgData = ctx.getImageData(0, 0, VIDEO_SIZE, VIDEO_SIZE);
+  var data = imgData.data;
+  var third = Math.floor(VIDEO_SIZE / 3);
+  var rowBytes = VIDEO_SIZE * 4;
+
+  // Analyze bottom third (near objects / ground)
+  var bottomEdgeCount = 0;
+  var bottomStart = third * 2 * rowBytes;
+  for (var i = bottomStart; i < data.length - rowBytes; i += 16) {
+    var diff = Math.abs(data[i] - data[i + rowBytes]);
+    if (diff > 40) bottomEdgeCount++;
+  }
+  var bottomTotal = (data.length - bottomStart) / 16;
+  var bottomEdgeRatio = bottomEdgeCount / bottomTotal;
+
+  // Analyze center region for large blocking objects
+  var centerDarkCount = 0;
+  var centerTotal = 0;
+  var centerXStart = Math.floor(VIDEO_SIZE * 0.25);
+  var centerXEnd = Math.floor(VIDEO_SIZE * 0.75);
+  var centerYStart = third;
+  var centerYEnd = third * 2;
+  for (var y = centerYStart; y < centerYEnd; y += 4) {
+    for (var x = centerXStart; x < centerXEnd; x += 4) {
+      var idx = (y * VIDEO_SIZE + x) * 4;
+      var brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+      centerTotal++;
+      if (brightness < 60) centerDarkCount++;
+    }
+  }
+  var centerDarkPercent = centerTotal > 0 ? centerDarkCount / centerTotal : 0;
+
+  var groundObstructed = bottomEdgeRatio > 0.3;
+  var centerBlocked = centerDarkPercent > 0.3;
+
+  var proximity = "clear";
+  if (groundObstructed || centerBlocked) proximity = "close";
+  else if (bottomEdgeRatio > 0.15 || centerDarkPercent > 0.15) proximity = "medium";
+  else if (bottomEdgeRatio > 0.05) proximity = "far";
+
+  return {
+    ground_obstructed: groundObstructed,
+    center_blocked: centerBlocked,
+    proximity: proximity,
+  };
+}
+
 function startVideoCapture() {
   var ctx = canvas.getContext("2d");
   canvas.width = VIDEO_SIZE;
@@ -745,9 +822,15 @@ function startVideoCapture() {
 
   videoTimer = setInterval(function () {
     if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
-    if (orientationBad) return; // Skip frame — phone pointing wrong way
 
     ctx.drawImage(video, 0, 0, VIDEO_SIZE, VIDEO_SIZE);
+
+    // Frame diff: skip unchanged frames in navigation mode (save tokens)
+    if (currentMode === "navigation" && !hasFrameChanged(ctx)) {
+      framesSkipped++;
+      return;
+    }
+
     framesSent++;
 
     // Capture sensor snapshot for this frame
@@ -765,28 +848,33 @@ function startVideoCapture() {
       headingDelta = 0; // Reset for next frame interval
     }
 
-    canvas.toBlob(
-      function (blob) {
-        if (!blob) return;
-        var reader = new FileReader();
-        reader.onloadend = function () {
-          var base64 = reader.result.split(",")[1];
-          var msg = { type: "image", data: base64, frame: framesSent };
-          if (sensorData) msg.sensors = sensorData;
-          ws.send(JSON.stringify(msg));
-          framesSuccess++;
-          updateConnectionQuality();
-        };
-        reader.readAsDataURL(blob);
-      },
-      "image/jpeg",
-      VIDEO_QUALITY
-    );
+    // Add proximity estimation
+    var proximity = estimateProximity(ctx);
+    if (!sensorData) sensorData = {};
+    sensorData.proximity = proximity.proximity;
+    sensorData.ground_obstructed = proximity.ground_obstructed;
+    sensorData.center_blocked = proximity.center_blocked;
+
+    // Tag bad orientation instead of skipping frame entirely
+    if (orientationBad) {
+      sensorData.orientation_bad = true;
+    }
+
+    // Optimized encoding: canvas.toDataURL instead of toBlob + FileReader
+    var dataUrl = canvas.toDataURL("image/jpeg", VIDEO_QUALITY);
+    var base64 = dataUrl.split(",")[1];
+    var msg = { type: "image", data: base64, frame: framesSent };
+    msg.sensors = sensorData;
+    ws.send(JSON.stringify(msg));
+    framesSuccess++;
+    updateConnectionQuality();
   }, VIDEO_FRAME_INTERVAL);
 }
 
 function stopSession() {
   isRunning = false;
+  previousFrameData = null;
+  framesSkipped = 0;
   reconnectAttempts = MAX_RECONNECT_ATTEMPTS; // Prevent reconnect during intentional stop
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   stopOrientationMonitor();
