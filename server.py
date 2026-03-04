@@ -125,13 +125,14 @@ async def websocket_endpoint(websocket: WebSocket):
         session_resumption=types.SessionResumptionConfig(),
         # Model decides when to speak vs stay silent
         proactivity=types.ProactivityConfig(proactive_audio=True),
-        # VAD: less sensitive to background noise
+        # VAD: HIGH start sensitivity so user can interrupt by speaking
+        # HIGH end sensitivity so model responds quickly after user stops
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=False,
-                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                silence_duration_ms=300,
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                silence_duration_ms=500,
             ),
         ),
     )
@@ -181,9 +182,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             # Stream ALL frames silently — model accumulates context
                             live_request_queue.send_realtime(image_blob)
 
-                            # Only prompt periodically — short prompts to avoid token waste
-                            # Navigation: every 5th frame (~5s), Reading/Explore: every 8th frame (~16s)
-                            prompt_interval = 5 if mode == "navigation" else 8
+                            # Prompt periodically — short prompts to avoid token waste
+                            # Navigation: every 3rd frame (~3s), Reading/Explore: every 5th frame (~10s)
+                            prompt_interval = 3 if mode == "navigation" else 5
                             if frame_num > 0 and frame_num % prompt_interval == 0:
                                 if mode == "navigation":
                                     prompt_text = "[NAV] What's in the path? Warn if obstacle, else confirm clear."
@@ -212,11 +213,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             session_stats["current_mode"] = mode
                             logger.info(f"Mode switched to: {mode}")
                             if mode == "navigation":
-                                switch_text = "[MODE: NAVIGATION] Focus on path safety. Warn about obstacles with direction to avoid."
+                                switch_text = "[MODE: NAVIGATION] Focus on path safety. What's in the user's path right now? Warn if obstacle, else confirm clear."
                             elif mode == "reading":
-                                switch_text = "[MODE: READING] Acknowledge visible text, then wait for user to ask before reading."
+                                switch_text = "[MODE: READING] Switched to reading mode. What text or content do you see? Acknowledge briefly."
                             else:
-                                switch_text = "[MODE: EXPLORATION] Describe surroundings when asked. Answer user's questions."
+                                switch_text = "[MODE: EXPLORATION] Switched to exploration mode. Briefly describe what you see around the user."
                             content = types.Content(
                                 parts=[types.Part(text=switch_text)]
                             )
