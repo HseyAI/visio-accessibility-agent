@@ -32,6 +32,15 @@ echo "  Project: ${PROJECT_ID}"
 echo "  Region:  ${REGION}"
 echo "  Image:   ${IMAGE}"
 
+# Enable required GCP APIs
+echo "Enabling GCP APIs..."
+gcloud services enable \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  firestore.googleapis.com \
+  logging.googleapis.com \
+  --project "${PROJECT_ID}" --quiet 2>/dev/null || true
+
 # Build container image using Cloud Build
 echo "Building container image..."
 gcloud builds submit --tag "${IMAGE}" --project "${PROJECT_ID}" --quiet

@@ -45,6 +45,12 @@ let isRunning = false;
 let framesSent = 0;
 let framesSuccess = 0;
 let hazardTimeout = null;
+let pannerNode = null;
+let panResetTimeout = null;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY = 1000; // ms, doubles each attempt
 
 // Orientation state
 let orientationBad = false;
@@ -348,6 +354,167 @@ function requestOrientationPermission() {
 }
 
 // ---------------------------------------------------------------------------
+// Emergency SOS — double-tap activation + Geolocation
+// ---------------------------------------------------------------------------
+const sosBtn = document.getElementById("sosBtn");
+let sosActive = false;
+let sosLastTap = 0;
+let sosLocationWatchId = null;
+let lastKnownLocation = null;
+
+// Double-tap detection on SOS button
+sosBtn.addEventListener("click", function () {
+  var now = Date.now();
+  if (now - sosLastTap < 500) {
+    // Double tap detected
+    toggleSOS();
+  }
+  sosLastTap = now;
+});
+
+function toggleSOS() {
+  if (sosActive) {
+    deactivateSOS();
+  } else {
+    activateSOS();
+  }
+}
+
+function activateSOS() {
+  sosActive = true;
+  sosBtn.classList.add("active");
+  sosBtn.querySelector(".sos-hint").textContent = "Double-tap to cancel";
+
+  // Strong haptic alert
+  if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+
+  // Get location and send emergency
+  getLocationAndSendSOS();
+
+  // Start watching location for continuous updates
+  if ("geolocation" in navigator) {
+    sosLocationWatchId = navigator.geolocation.watchPosition(
+      function (pos) {
+        lastKnownLocation = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: Math.round(pos.coords.accuracy),
+        };
+      },
+      function () {},
+      { enableHighAccuracy: true, maximumAge: 5000 }
+    );
+  }
+}
+
+function deactivateSOS() {
+  sosActive = false;
+  sosBtn.classList.remove("active");
+  sosBtn.querySelector(".sos-hint").textContent = "Double-tap for emergency";
+
+  if (sosLocationWatchId !== null) {
+    navigator.geolocation.clearWatch(sosLocationWatchId);
+    sosLocationWatchId = null;
+  }
+
+  // Tell Visio emergency is over
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "text", data: "[SOS DEACTIVATED] The user has cancelled the emergency. Resume normal operation." }));
+  }
+  addTranscript("SOS deactivated", "user");
+}
+
+function getLocationAndSendSOS() {
+  if ("geolocation" in navigator) {
+    navigator.geolocation.getCurrentPosition(
+      function (pos) {
+        lastKnownLocation = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: Math.round(pos.coords.accuracy),
+        };
+        sendSOSMessage(lastKnownLocation);
+      },
+      function () {
+        // Location failed — send SOS without coordinates
+        sendSOSMessage(null);
+      },
+      { enableHighAccuracy: true, timeout: 5000 }
+    );
+  } else {
+    sendSOSMessage(null);
+  }
+}
+
+function sendSOSMessage(location) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  var msg = "[EMERGENCY SOS ACTIVATED] The user has triggered an emergency alert. ";
+  if (location) {
+    msg += "GPS Location: " + location.lat.toFixed(6) + ", " + location.lng.toFixed(6) + " (accuracy: ~" + location.accuracy + "m). ";
+    msg += "Google Maps: https://maps.google.com/?q=" + location.lat.toFixed(6) + "," + location.lng.toFixed(6) + " — ";
+  } else {
+    msg += "GPS location unavailable. ";
+  }
+  msg += "Immediately describe ALL visible signs, street names, landmarks, and building names. Identify exits and safe paths. Stay calm and keep providing location details until the user says they are safe.";
+
+  ws.send(JSON.stringify({ type: "text", data: msg }));
+  addTranscript("SOS ACTIVATED" + (location ? " (Location shared)" : ""), "user");
+}
+
+// Also listen for the voice keyword "emergency" to auto-trigger SOS
+function checkForEmergencyKeyword(text) {
+  if (sosActive) return; // Already active
+  var lower = text.toLowerCase();
+  if (lower.includes("emergency") || lower.includes("help me") || lower.includes("i need help") || lower.includes("i'm lost")) {
+    activateSOS();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spatial Audio — StereoPanner for directional cues
+// ---------------------------------------------------------------------------
+const DIRECTION_PATTERNS = [
+  { regex: /\b(on your left|to your left|from the left|left side|to the left)\b/i, pan: -0.8 },
+  { regex: /\b(on your right|to your right|from the right|right side|to the right)\b/i, pan: 0.8 },
+  { regex: /\b(your\s*9\s*o['']?clock|your\s*10\s*o['']?clock)\b/i, pan: -0.7 },
+  { regex: /\b(your\s*2\s*o['']?clock|your\s*3\s*o['']?clock)\b/i, pan: 0.7 },
+  { regex: /\b(your\s*11\s*o['']?clock|your\s*1\s*o['']?clock)\b/i, pan: -0.3 },
+  { regex: /\b(your\s*4\s*o['']?clock|your\s*5\s*o['']?clock)\b/i, pan: 0.3 },
+  { regex: /\b(ahead|in front|straight ahead|directly ahead|behind you|your\s*12\s*o['']?clock|your\s*6\s*o['']?clock)\b/i, pan: 0.0 },
+];
+
+function detectDirection(text) {
+  for (var i = 0; i < DIRECTION_PATTERNS.length; i++) {
+    if (DIRECTION_PATTERNS[i].regex.test(text)) {
+      return DIRECTION_PATTERNS[i].pan;
+    }
+  }
+  return null; // No directional keyword found
+}
+
+function applySpatialPan(panValue) {
+  if (!pannerNode || !playbackContext) return;
+
+  // Clear any pending reset
+  if (panResetTimeout) { clearTimeout(panResetTimeout); panResetTimeout = null; }
+
+  // Smooth ramp to target pan over 150ms
+  var now = playbackContext.currentTime;
+  pannerNode.pan.cancelScheduledValues(now);
+  pannerNode.pan.linearRampToValueAtTime(panValue, now + 0.15);
+
+  // Reset to center after 3 seconds
+  panResetTimeout = setTimeout(function () {
+    if (pannerNode && playbackContext) {
+      var t = playbackContext.currentTime;
+      pannerNode.pan.cancelScheduledValues(t);
+      pannerNode.pan.linearRampToValueAtTime(0, t + 0.3);
+    }
+  }, 3000);
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
 async function startSession() {
@@ -375,7 +542,10 @@ async function startSession() {
     playbackContext = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
     await playbackContext.audioWorklet.addModule("/static/audio-player.js");
     playerNode = new AudioWorkletNode(playbackContext, "pcm-player-processor");
-    playerNode.connect(playbackContext.destination);
+    pannerNode = playbackContext.createStereoPanner();
+    pannerNode.pan.value = 0;
+    playerNode.connect(pannerNode);
+    pannerNode.connect(playbackContext.destination);
     playerNode.port.onmessage = function (e) {
       if (e.data.type === "ended") {
         visualizer.classList.remove("active");
@@ -389,13 +559,24 @@ async function startSession() {
     ws = new WebSocket(protocol + "//" + location.host + "/ws");
     ws.binaryType = "arraybuffer";
 
+    // Connection timeout — if WebSocket doesn't open in 10s, retry
+    var connectTimeout = setTimeout(function () {
+      if (ws && ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+        setStatus("", "Connection timed out");
+      }
+    }, 10000);
+
     ws.onopen = function () {
+      clearTimeout(connectTimeout);
+      reconnectAttempts = 0;
       isRunning = true;
       framesSent = 0;
       framesSuccess = 0;
       setStatus("connected", "Connected - Visio is watching and listening");
       startBtn.disabled = true;
       stopBtn.disabled = false;
+      sosBtn.disabled = false;
       startAudioCapture();
       startVideoCapture();
       requestOrientationPermission();
@@ -404,37 +585,110 @@ async function startSession() {
       if (langSelect.value !== "English") {
         ws.send(JSON.stringify({ type: "language", data: langSelect.value }));
       }
-    };
 
-    ws.onmessage = function (event) {
-      if (event.data instanceof ArrayBuffer) {
-        // Binary audio from agent — feed to ring buffer player
-        playerNode.port.postMessage(event.data);
-        setStatus("speaking", "Visio is speaking...");
-        visualizer.classList.add("active");
-      } else {
-        // Text JSON message
-        try {
-          var msg = JSON.parse(event.data);
-          if (msg.type === "transcript") {
-            addTranscript(msg.data, "agent");
-            processAgentResponse(msg.data);
-          }
-        } catch (e) {
-          addTranscript(event.data, "agent");
-        }
+      // Restore current mode if reconnecting
+      if (currentMode !== "navigation") {
+        ws.send(JSON.stringify({ type: "mode", data: currentMode }));
       }
     };
+
+    ws.onmessage = handleWsMessage;
 
     ws.onclose = function () {
-      if (isRunning) {
-        setStatus("", "Disconnected");
-        stopSession();
-      }
+      clearTimeout(connectTimeout);
+      handleWsClose();
     };
-    ws.onerror = function () { setStatus("", "Connection error"); };
+
+    ws.onerror = function () {
+      // onerror is always followed by onclose — let onclose handle reconnect
+    };
   } catch (err) {
     setStatus("", "Error: " + err.message);
+  }
+}
+
+// Reconnect WebSocket without restarting camera/audio playback
+function reconnectWebSocket() {
+  if (!isRunning || !mediaStream) return;
+
+  try {
+    var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(protocol + "//" + location.host + "/ws");
+    ws.binaryType = "arraybuffer";
+
+    var connectTimeout = setTimeout(function () {
+      if (ws && ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    }, 10000);
+
+    ws.onopen = function () {
+      clearTimeout(connectTimeout);
+      reconnectAttempts = 0;
+      setStatus("connected", "Reconnected - Visio is back");
+      addTranscript("Reconnected successfully.", "agent");
+      startAudioCapture();
+      startVideoCapture();
+
+      if (langSelect.value !== "English") {
+        ws.send(JSON.stringify({ type: "language", data: langSelect.value }));
+      }
+      if (currentMode !== "navigation") {
+        ws.send(JSON.stringify({ type: "mode", data: currentMode }));
+      }
+    };
+
+    ws.onmessage = handleWsMessage;
+    ws.onclose = handleWsClose;
+    ws.onerror = function () {};
+  } catch (e) {
+    // Will retry via onclose
+  }
+}
+
+function handleWsMessage(event) {
+  if (event.data instanceof ArrayBuffer) {
+    if (playerNode) playerNode.port.postMessage(event.data);
+    setStatus("speaking", "Visio is speaking...");
+    visualizer.classList.add("active");
+  } else {
+    try {
+      var msg = JSON.parse(event.data);
+      if (msg.type === "transcript") {
+        addTranscript(msg.data, "agent");
+        processAgentResponse(msg.data);
+        var panValue = detectDirection(msg.data);
+        if (panValue !== null) applySpatialPan(panValue);
+      } else if (msg.type === "user_transcript") {
+        addTranscript(msg.data, "user");
+        checkForEmergencyKeyword(msg.data);
+      }
+    } catch (e) {
+      addTranscript(event.data, "agent");
+    }
+  }
+}
+
+function handleWsClose() {
+  if (isRunning) {
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      var delay = RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts);
+      reconnectAttempts++;
+      setStatus("", "Connection lost — reconnecting (" + reconnectAttempts + "/" + MAX_RECONNECT_ATTEMPTS + ")...");
+      addTranscript("Connection lost. Reconnecting...", "agent");
+
+      if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+      if (audioWorklet) { audioWorklet.disconnect(); audioWorklet = null; }
+      if (audioContext) { audioContext.close(); audioContext = null; }
+
+      reconnectTimer = setTimeout(function () {
+        reconnectWebSocket();
+      }, delay);
+    } else {
+      setStatus("", "Disconnected — please restart");
+      addTranscript("Could not reconnect. Please tap Start to try again.", "agent");
+      stopSession();
+    }
   }
 }
 
@@ -471,7 +725,7 @@ function startVideoCapture() {
         var reader = new FileReader();
         reader.onloadend = function () {
           var base64 = reader.result.split(",")[1];
-          ws.send(JSON.stringify({ type: "image", data: base64 }));
+          ws.send(JSON.stringify({ type: "image", data: base64, frame: framesSent }));
           framesSuccess++;
           updateConnectionQuality();
         };
@@ -485,11 +739,15 @@ function startVideoCapture() {
 
 function stopSession() {
   isRunning = false;
+  reconnectAttempts = MAX_RECONNECT_ATTEMPTS; // Prevent reconnect during intentional stop
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   stopOrientationMonitor();
   if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
   if (audioWorklet) { audioWorklet.disconnect(); audioWorklet = null; }
   if (audioContext) { audioContext.close(); audioContext = null; }
   if (playerNode) { playerNode.port.postMessage({ command: "stop" }); }
+  if (panResetTimeout) { clearTimeout(panResetTimeout); panResetTimeout = null; }
+  if (pannerNode) { pannerNode.disconnect(); pannerNode = null; }
   if (playbackContext) { playbackContext.close(); playbackContext = null; playerNode = null; }
   if (mediaStream) { mediaStream.getTracks().forEach(function (t) { t.stop(); }); mediaStream = null; }
   if (ws) { ws.close(); ws = null; }
@@ -498,6 +756,8 @@ function stopSession() {
   cameraSection.classList.remove("hazard-flash");
   hazardBanner.className = "hazard-banner";
   setStatus("", "Disconnected");
+  if (sosActive) deactivateSOS();
+  sosBtn.disabled = true;
   startBtn.disabled = false;
   stopBtn.disabled = true;
 }

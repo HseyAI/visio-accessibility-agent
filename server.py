@@ -4,6 +4,7 @@ import json
 import os
 import logging
 import uuid
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -18,8 +19,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Cloud Logging — structured logs on GCP, standard logging locally
+# ---------------------------------------------------------------------------
+cloud_logging_enabled = False
+try:
+    import google.cloud.logging as cloud_logging
+    cloud_client = cloud_logging.Client()
+    cloud_client.setup_logging()
+    cloud_logging_enabled = True
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.info("Cloud Logging initialized")
+except Exception:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.info("Cloud Logging unavailable — using standard logging")
+
+# ---------------------------------------------------------------------------
+# Firestore — session analytics on GCP, in-memory fallback locally
+# ---------------------------------------------------------------------------
+firestore_db = None
+try:
+    from google.cloud import firestore
+    firestore_db = firestore.Client()
+    # Quick connectivity test
+    firestore_db.collection("_health").document("ping").set({"ts": time.time()})
+    logger.info("Firestore initialized")
+except Exception:
+    firestore_db = None
+    logger.info("Firestore unavailable — session analytics disabled")
 
 APP_NAME = "visio-agent"
 
@@ -45,7 +74,14 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": root_agent.model}
+    return {
+        "status": "ok",
+        "model": root_agent.model,
+        "services": {
+            "cloud_logging": cloud_logging_enabled,
+            "firestore": firestore_db is not None,
+        },
+    }
 
 
 @app.websocket("/ws")
@@ -55,6 +91,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
     user_id = f"user_{uuid.uuid4().hex[:8]}"
     session_id = f"session_{uuid.uuid4().hex[:8]}"
+
+    # Session analytics
+    session_start = time.time()
+    session_stats = {
+        "frames_sent": 0,
+        "audio_chunks_sent": 0,
+        "audio_chunks_received": 0,
+        "transcripts_sent": 0,
+        "mode_switches": 0,
+        "language_switches": 0,
+        "sos_activations": 0,
+        "current_mode": "navigation",
+    }
 
     await session_service.create_session(
         app_name=APP_NAME,
@@ -86,6 +135,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Binary frame = raw audio PCM
                 raw_bytes = msg.get("bytes")
                 if raw_bytes:
+                    session_stats["audio_chunks_sent"] += 1
                     audio_blob = types.Blob(
                         mime_type="audio/pcm;rate=16000",
                         data=raw_bytes,
@@ -101,21 +151,35 @@ async def websocket_endpoint(websocket: WebSocket):
                         msg_type = data.get("type")
 
                         if msg_type == "image":
+                            session_stats["frames_sent"] += 1
                             image_bytes = base64.b64decode(data["data"])
                             image_blob = types.Blob(
                                 mime_type="image/jpeg",
                                 data=image_bytes,
                             )
+                            # Send frame context every 5th frame to prompt change detection
+                            frame_num = data.get("frame", 0)
+                            if frame_num > 0 and frame_num % 5 == 0:
+                                context = types.Content(
+                                    parts=[types.Part(text=f"[FRAME {frame_num}] What has changed since last update? Give a brief navigation update — what's ahead, what the user is passing, any new obstacles or people.")]
+                                )
+                                live_request_queue.send_content(context)
                             live_request_queue.send_realtime(image_blob)
 
                         elif msg_type == "text":
+                            text_data = data["data"]
+                            if "[EMERGENCY SOS" in text_data:
+                                session_stats["sos_activations"] += 1
+                                logger.warning(f"SOS activated — {session_id}")
                             content = types.Content(
-                                parts=[types.Part(text=data["data"])]
+                                parts=[types.Part(text=text_data)]
                             )
                             live_request_queue.send_content(content)
 
                         elif msg_type == "mode":
                             mode = data.get("data", "navigation")
+                            session_stats["mode_switches"] += 1
+                            session_stats["current_mode"] = mode
                             logger.info(f"Mode switched to: {mode}")
                             content = types.Content(
                                 parts=[types.Part(text=f"[MODE SWITCH: {mode.upper()}] Adjust your behavior to {mode} mode accordingly.")]
@@ -124,6 +188,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         elif msg_type == "language":
                             lang = data.get("data", "English")
+                            session_stats["language_switches"] += 1
                             logger.info(f"Language switched to: {lang}")
                             content = types.Content(
                                 parts=[types.Part(text=f"[LANGUAGE: {lang}] Respond in {lang} from now on. Translate any text you see into {lang}.")]
@@ -160,11 +225,18 @@ async def websocket_endpoint(websocket: WebSocket):
                             and part.inline_data.mime_type
                             and "audio" in part.inline_data.mime_type
                         ):
+                            session_stats["audio_chunks_received"] += 1
                             await websocket.send_bytes(part.inline_data.data)
 
                         if part.text:
+                            session_stats["transcripts_sent"] += 1
+                            # Distinguish user transcription from agent response
+                            is_user = getattr(event, 'author', '') == 'user' or (
+                                event.content.role and event.content.role == 'user'
+                            )
+                            msg_type = "user_transcript" if is_user else "transcript"
                             await websocket.send_text(
-                                json.dumps({"type": "transcript", "data": part.text})
+                                json.dumps({"type": msg_type, "data": part.text})
                             )
                     except Exception:
                         pass
@@ -178,7 +250,27 @@ async def websocket_endpoint(websocket: WebSocket):
         await asyncio.gather(upstream(), downstream(), return_exceptions=True)
     finally:
         live_request_queue.close()
-        logger.info("Session ended")
+        duration = round(time.time() - session_start, 1)
+        logger.info(f"Session ended — {session_id} — {duration}s, {session_stats['frames_sent']} frames, {session_stats['transcripts_sent']} transcripts")
+
+        # Persist session analytics to Firestore
+        if firestore_db:
+            try:
+                firestore_db.collection("sessions").document(session_id).set({
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "started_at": session_start,
+                    "duration_seconds": duration,
+                    "frames_sent": session_stats["frames_sent"],
+                    "audio_chunks_sent": session_stats["audio_chunks_sent"],
+                    "audio_chunks_received": session_stats["audio_chunks_received"],
+                    "transcripts_sent": session_stats["transcripts_sent"],
+                    "mode_switches": session_stats["mode_switches"],
+                    "language_switches": session_stats["language_switches"],
+                    "final_mode": session_stats["current_mode"],
+                })
+            except Exception as e:
+                logger.warning(f"Failed to save session analytics: {e}")
 
 
 if __name__ == "__main__":
