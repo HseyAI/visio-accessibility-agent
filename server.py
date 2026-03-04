@@ -157,11 +157,19 @@ async def websocket_endpoint(websocket: WebSocket):
                                 mime_type="image/jpeg",
                                 data=image_bytes,
                             )
-                            # Send frame context every 5th frame to prompt change detection
+                            # Send frame context prompt every 3rd frame
                             frame_num = data.get("frame", 0)
-                            if frame_num > 0 and frame_num % 5 == 0:
+                            mode = session_stats.get("current_mode", "navigation")
+                            prompt_interval = 3 if mode == "navigation" else 5
+                            if frame_num > 0 and frame_num % prompt_interval == 0:
+                                if mode == "navigation":
+                                    prompt_text = f"[FRAME {frame_num}] Briefly: any NEW hazards, obstacles, or important changes? If nothing new, stay silent."
+                                elif mode == "reading":
+                                    prompt_text = f"[FRAME {frame_num}] Any text or signs visible? Read them if new."
+                                else:
+                                    prompt_text = f"[FRAME {frame_num}] Describe the current scene — what's around the user?"
                                 context = types.Content(
-                                    parts=[types.Part(text=f"[FRAME {frame_num}] What has changed since last update? Give a brief navigation update — what's ahead, what the user is passing, any new obstacles or people.")]
+                                    parts=[types.Part(text=prompt_text)]
                                 )
                                 live_request_queue.send_content(context)
                             live_request_queue.send_realtime(image_blob)
