@@ -117,9 +117,10 @@ async def websocket_endpoint(websocket: WebSocket):
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         # Unlimited session duration — prevents hallucination after 2min
+        # Video = ~258 tokens/sec, 128k context burns in ~8min without compression
         context_window_compression=types.ContextWindowCompressionConfig(
-            trigger_tokens=80000,
-            sliding_window=types.SlidingWindow(target_tokens=60000),
+            trigger_tokens=100000,
+            sliding_window=types.SlidingWindow(target_tokens=80000),
         ),
         # Auto-reconnect on WebSocket ~10min timeout
         session_resumption=types.SessionResumptionConfig(),
@@ -176,26 +177,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                 mime_type="image/jpeg",
                                 data=image_bytes,
                             )
-                            frame_num = data.get("frame", 0)
-                            mode = session_stats.get("current_mode", "navigation")
-
-                            # Stream ALL frames silently — model accumulates context
+                            # Stream frames silently — proactive_audio lets model
+                            # decide when to speak based on what it sees.
+                            # NO send_content() prompts — they force responses,
+                            # queue up, cause latency, and override user voice.
                             live_request_queue.send_realtime(image_blob)
-
-                            # Prompt periodically — short prompts to avoid token waste
-                            # Navigation: every 3rd frame (~3s), Reading/Explore: every 5th frame (~10s)
-                            prompt_interval = 3 if mode == "navigation" else 5
-                            if frame_num > 0 and frame_num % prompt_interval == 0:
-                                if mode == "navigation":
-                                    prompt_text = "[NAV] What's in the path? Warn if obstacle, else confirm clear."
-                                elif mode == "reading":
-                                    prompt_text = "[READ] What text is visible? Acknowledge briefly — wait for user to ask for details."
-                                else:
-                                    prompt_text = "[EXPLORE] Brief scene update — only mention changes from last update."
-                                context = types.Content(
-                                    parts=[types.Part(text=prompt_text)]
-                                )
-                                live_request_queue.send_content(context)
 
                         elif msg_type == "text":
                             text_data = data["data"]
