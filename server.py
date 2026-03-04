@@ -180,6 +180,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             )
                             frame_num = data.get("frame", 0)
                             mode = session_stats.get("current_mode", "navigation")
+                            sensors = data.get("sensors")
 
                             # Always stream frames — model accumulates visual context
                             live_request_queue.send_realtime(image_blob)
@@ -190,9 +191,24 @@ async def websocket_endpoint(websocket: WebSocket):
                             if mode == "navigation" and frame_num > 0 and frame_num % 3 == 0:
                                 now = time.time()
                                 if now - last_user_speech_time > 3.0:
+                                    # Build sensor context string
+                                    sensor_ctx = ""
+                                    if sensors:
+                                        parts_list = []
+                                        if sensors.get("heading") is not None:
+                                            parts_list.append(f"compass {sensors['heading']}°")
+                                        if sensors.get("turn") and sensors["turn"] != "steady":
+                                            parts_list.append(f"user {sensors['turn']}")
+                                        if sensors.get("lean") is not None:
+                                            lean = sensors["lean"]
+                                            if abs(lean) > 10:
+                                                parts_list.append(f"phone tilted {'right' if lean > 0 else 'left'} {abs(lean)}°")
+                                        if parts_list:
+                                            sensor_ctx = " | Sensors: " + ", ".join(parts_list)
+
                                     live_request_queue.send_content(
                                         types.Content(parts=[types.Part(
-                                            text="[NAV] Live check — anything in the path? Warn with correct direction (image left=user's left). Stay silent if clear."
+                                            text=f"[NAV] Live path check{sensor_ctx}. Obstacles? Give direction relative to USER (image-left=user-left). Silent if clear."
                                         )])
                                     )
                             # Reading/Exploration: NO periodic prompts.

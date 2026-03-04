@@ -60,6 +60,9 @@ let lastOrientationWarnTime = 0;
 let orientationReadings = [];  // rolling window of {beta, gamma, ts}
 let badOrientationStart = 0;   // when bad orientation was first detected
 let orientationHideTimer = null;
+let lastOrientation = { alpha: null, beta: null, gamma: null }; // latest gyroscope
+let prevHeading = null;        // previous compass heading for turn detection
+let headingDelta = 0;          // accumulated heading change between frames
 
 // ---------------------------------------------------------------------------
 // DOM Elements
@@ -278,10 +281,24 @@ function handleOrientationEvent(event) {
   if (!isRunning) return;
 
   var now = Date.now();
+  var alpha = event.alpha; // compass heading (0-360)
   var beta = event.beta;   // front/back tilt (-180 to 180)
   var gamma = event.gamma; // left/right tilt (-90 to 90)
 
   if (beta === null && gamma === null) return;
+
+  // Store latest orientation for frame metadata
+  lastOrientation = { alpha: alpha, beta: beta, gamma: gamma };
+
+  // Track heading changes for turn detection
+  if (alpha !== null && prevHeading !== null) {
+    var diff = alpha - prevHeading;
+    // Normalize to -180..180
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    headingDelta += diff;
+  }
+  if (alpha !== null) prevHeading = alpha;
 
   // Add to rolling window
   orientationReadings.push({ beta: beta || 0, gamma: gamma || 0, ts: now });
@@ -733,13 +750,30 @@ function startVideoCapture() {
     ctx.drawImage(video, 0, 0, VIDEO_SIZE, VIDEO_SIZE);
     framesSent++;
 
+    // Capture sensor snapshot for this frame
+    var sensorData = null;
+    if (lastOrientation.beta !== null) {
+      var turnDir = "steady";
+      if (headingDelta > 15) turnDir = "turning right";
+      else if (headingDelta < -15) turnDir = "turning left";
+      sensorData = {
+        heading: lastOrientation.alpha !== null ? Math.round(lastOrientation.alpha) : null,
+        tilt: Math.round(lastOrientation.beta),
+        lean: Math.round(lastOrientation.gamma),
+        turn: turnDir,
+      };
+      headingDelta = 0; // Reset for next frame interval
+    }
+
     canvas.toBlob(
       function (blob) {
         if (!blob) return;
         var reader = new FileReader();
         reader.onloadend = function () {
           var base64 = reader.result.split(",")[1];
-          ws.send(JSON.stringify({ type: "image", data: base64, frame: framesSent }));
+          var msg = { type: "image", data: base64, frame: framesSent };
+          if (sensorData) msg.sensors = sensorData;
+          ws.send(JSON.stringify(msg));
           framesSuccess++;
           updateConnectionQuality();
         };
