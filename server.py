@@ -157,17 +157,25 @@ async def websocket_endpoint(websocket: WebSocket):
                                 mime_type="image/jpeg",
                                 data=image_bytes,
                             )
-                            # Send frame context prompt every 3rd frame
                             frame_num = data.get("frame", 0)
                             mode = session_stats.get("current_mode", "navigation")
-                            prompt_interval = 4 if mode == "navigation" else 6
+
+                            # Navigation: prompt every 3rd frame (~2.4s) focused on PATH SAFETY
+                            # Other modes: every 5th frame
+                            prompt_interval = 3 if mode == "navigation" else 5
                             if frame_num > 0 and frame_num % prompt_interval == 0:
                                 if mode == "navigation":
-                                    prompt_text = f"[FRAME {frame_num}] Quick update: any hazards or changes? If nothing new, just confirm path is clear."
+                                    prompt_text = (
+                                        f"[FRAME {frame_num}] SCAN THE PATH: "
+                                        f"Is there ANYTHING in the user's walking path? "
+                                        f"Vehicles, steps, obstacles, people, walls? "
+                                        f"If yes → warn immediately with direction to avoid. "
+                                        f"If path is genuinely clear → brief confirmation."
+                                    )
                                 elif mode == "reading":
-                                    prompt_text = f"[FRAME {frame_num}] Any text or signs visible? Read them if new."
+                                    prompt_text = f"[FRAME {frame_num}] Read any visible text or signs."
                                 else:
-                                    prompt_text = f"[FRAME {frame_num}] Describe the current scene — what's around the user?"
+                                    prompt_text = f"[FRAME {frame_num}] Describe what's around the user."
                                 context = types.Content(
                                     parts=[types.Part(text=prompt_text)]
                                 )
