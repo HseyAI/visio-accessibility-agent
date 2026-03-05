@@ -185,6 +185,7 @@ async def websocket_endpoint(websocket: WebSocket):
         "language_switches": 0,
         "sos_activations": 0,
         "current_mode": "navigation",
+        "detected_environments": [],
     }
 
     await session_service.create_session(
@@ -227,9 +228,12 @@ async def websocket_endpoint(websocket: WebSocket):
     live_request_queue = LiveRequestQueue()
     running = True
     last_user_speech_time = 0.0  # Track when user last spoke
+    last_model_speech_time = time.time()  # Track when model last spoke
+    scene_changed_since_response = False  # Has scene changed since model last spoke?
+    last_nudge_time = 0.0  # Cooldown for silence-breaking nudges
 
     async def upstream():
-        nonlocal running, last_user_speech_time, last_frame_num
+        nonlocal running, last_user_speech_time, last_frame_num, scene_changed_since_response, last_nudge_time
         try:
             while running:
                 msg = await websocket.receive()
@@ -271,8 +275,20 @@ async def websocket_endpoint(websocket: WebSocket):
                             # Always stream frames — model accumulates visual context
                             live_request_queue.send_realtime(image_blob)
 
-                            # NO periodic nav prompts — proactive_audio handles it.
-                            # Only send proximity alerts when client detects close obstacles.
+                            # Mark scene as changed for silence nudge
+                            scene_changed_since_response = True
+
+                            # Build sensor context string for model
+                            sensor_context_parts = []
+                            if sensors:
+                                speed = sensors.get("speed", "stationary")
+                                steps = sensors.get("steps_since_last", 0)
+                                total_steps = sensors.get("total_steps", 0)
+                                is_moving = sensors.get("is_moving", False)
+                                if is_moving or steps > 0:
+                                    sensor_context_parts.append(f"Motion: {speed}, {steps} new steps (total: {total_steps})")
+
+                            # Proximity alerts when client detects close obstacles
                             if sensors and sensors.get("proximity") in ("close",):
                                 ground = sensors.get("ground_obstructed", False)
                                 center = sensors.get("center_blocked", False)
@@ -282,9 +298,27 @@ async def websocket_endpoint(websocket: WebSocket):
                                 if center:
                                     hints.append("large object in center of frame")
                                 hint_str = " — ".join(hints) if hints else "obstacle very close"
+                                sensor_context_parts.append(f"PROXIMITY ALERT: {hint_str}")
+
+                            # Send sensor context if any
+                            if sensor_context_parts:
                                 live_request_queue.send_content(
                                     types.Content(parts=[types.Part(
-                                        text=f"[PROXIMITY ALERT] Sensors detect: {hint_str}. Check the scene and warn the user immediately if there's danger."
+                                        text="[SENSORS] " + " | ".join(sensor_context_parts)
+                                    )])
+                                )
+
+                            # Silence-breaking nudge: if model silent >5s in nav mode
+                            now = time.time()
+                            if (session_stats["current_mode"] == "navigation"
+                                    and scene_changed_since_response
+                                    and now - last_model_speech_time > 5.0
+                                    and now - last_user_speech_time > 3.0
+                                    and now - last_nudge_time > 8.0):
+                                last_nudge_time = now
+                                live_request_queue.send_content(
+                                    types.Content(parts=[types.Part(
+                                        text="[SCENE UPDATE] A few seconds have passed. Is the path still safe? Speak if anything changed, stay quiet if nothing has."
                                     )])
                                 )
 
@@ -337,7 +371,7 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.error(f"Upstream error: {e}")
 
     async def downstream():
-        nonlocal running
+        nonlocal running, last_model_speech_time, scene_changed_since_response
         try:
             async for event in runner.run_live(
                 user_id=user_id,
@@ -358,6 +392,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             and "audio" in part.inline_data.mime_type
                         ):
                             session_stats["audio_chunks_received"] += 1
+                            last_model_speech_time = time.time()
+                            scene_changed_since_response = False
                             await websocket.send_bytes(part.inline_data.data)
 
                         if part.text:
@@ -373,6 +409,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
                             # Object memory — track obstacles in model responses
                             if not is_user:
+                                last_model_speech_time = time.time()
+                                scene_changed_since_response = False
                                 caution = check_obstacle_memory(obj_memory, part.text, last_frame_num)
                                 if caution:
                                     # Inject caution back to model so it relays to user
@@ -409,6 +447,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "mode_switches": session_stats["mode_switches"],
                     "language_switches": session_stats["language_switches"],
                     "final_mode": session_stats["current_mode"],
+                    "detected_environments": session_stats["detected_environments"],
                 })
             except Exception as e:
                 logger.warning(f"Failed to save session analytics: {e}")

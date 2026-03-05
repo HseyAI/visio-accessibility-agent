@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 const AUDIO_SAMPLE_RATE = 16000;
 const PLAYBACK_SAMPLE_RATE = 24000;
-const VIDEO_SIZE = 768;        // Google recommended — better obstacle detection
-const VIDEO_QUALITY = 0.5;     // 768px at 0.5 ≈ same bandwidth as 512 at 0.7
+const VIDEO_WIDTH = 1024;      // 16:9 wide-angle — more horizontal FOV
+const VIDEO_HEIGHT = 576;
+const VIDEO_QUALITY = 0.5;
 
 // Mode-specific frame intervals (ms)
 const MODE_FRAME_INTERVALS = {
@@ -68,6 +69,17 @@ let orientationHideTimer = null;
 let lastOrientation = { alpha: null, beta: null, gamma: null }; // latest gyroscope
 let prevHeading = null;        // previous compass heading for turn detection
 let headingDelta = 0;          // accumulated heading change between frames
+
+// Motion / accelerometer state
+let motionData = {
+  stepsSinceLast: 0,
+  totalSteps: 0,
+  speed: "stationary",
+  isMoving: false,
+};
+let lastStepTime = 0;
+let lastAccelPeak = false;     // was previous sample a peak?
+let accelHistory = [];         // rolling window for variance-based speed
 
 // ---------------------------------------------------------------------------
 // DOM Elements
@@ -361,6 +373,80 @@ function stopOrientationMonitor() {
   orientationBar.className = "orientation-bar";
 }
 
+// ---------------------------------------------------------------------------
+// DeviceMotion — step detection + speed estimation
+// ---------------------------------------------------------------------------
+var STEP_ACCEL_THRESHOLD = 1.2;   // m/s² above gravity for step peak
+var STEP_DEBOUNCE_MS = 300;       // min ms between steps
+var ACCEL_HISTORY_SIZE = 20;      // rolling window for speed variance
+
+function handleMotionEvent(event) {
+  if (!isRunning) return;
+
+  var accel = event.accelerationIncludingGravity;
+  if (!accel || accel.y === null) return;
+
+  var now = Date.now();
+  // Vertical acceleration (y-axis when phone held upright)
+  var ay = accel.y;
+  // Remove gravity component (~9.8) to get movement acceleration
+  var vertAccel = Math.abs(ay - 9.8);
+
+  // Rolling window for speed estimation
+  accelHistory.push(vertAccel);
+  while (accelHistory.length > ACCEL_HISTORY_SIZE) accelHistory.shift();
+
+  // Step detection: peak detection on vertical acceleration
+  var isPeak = vertAccel > STEP_ACCEL_THRESHOLD;
+  if (isPeak && !lastAccelPeak && (now - lastStepTime > STEP_DEBOUNCE_MS)) {
+    motionData.totalSteps++;
+    motionData.stepsSinceLast++;
+    lastStepTime = now;
+  }
+  lastAccelPeak = isPeak;
+
+  // Speed estimation from acceleration variance
+  if (accelHistory.length >= 5) {
+    var accelVar = variance(accelHistory);
+    if (accelVar < 0.1) {
+      motionData.speed = "stationary";
+      motionData.isMoving = false;
+    } else if (accelVar < 0.5) {
+      motionData.speed = "slow";
+      motionData.isMoving = true;
+    } else if (accelVar < 2.0) {
+      motionData.speed = "moderate";
+      motionData.isMoving = true;
+    } else {
+      motionData.speed = "fast";
+      motionData.isMoving = true;
+    }
+  }
+}
+
+function startMotionMonitor() {
+  window.addEventListener("devicemotion", handleMotionEvent);
+}
+
+function stopMotionMonitor() {
+  window.removeEventListener("devicemotion", handleMotionEvent);
+  accelHistory = [];
+  lastAccelPeak = false;
+  motionData = { stepsSinceLast: 0, totalSteps: 0, speed: "stationary", isMoving: false };
+}
+
+function requestMotionPermission() {
+  if (typeof DeviceMotionEvent !== "undefined" &&
+      typeof DeviceMotionEvent.requestPermission === "function") {
+    // iOS 13+ requires explicit permission
+    DeviceMotionEvent.requestPermission().then(function (state) {
+      if (state === "granted") startMotionMonitor();
+    }).catch(function () {});
+  } else {
+    startMotionMonitor();
+  }
+}
+
 function requestOrientationPermission() {
   if (typeof DeviceOrientationEvent !== "undefined" &&
       typeof DeviceOrientationEvent.requestPermission === "function") {
@@ -554,8 +640,8 @@ async function startSession() {
       },
       video: {
         facingMode: "environment",
-        width: { ideal: VIDEO_SIZE },
-        height: { ideal: VIDEO_SIZE },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
       },
     });
 
@@ -607,6 +693,7 @@ async function startSession() {
       startAudioCapture();
       startVideoCapture();
       requestOrientationPermission();
+      requestMotionPermission();
 
       // Send initial language if not English
       if (langSelect.value !== "English") {
@@ -747,7 +834,7 @@ async function startAudioCapture() {
 // Frame Diff — skip sending when scene hasn't changed
 // ---------------------------------------------------------------------------
 function hasFrameChanged(ctx) {
-  var current = ctx.getImageData(0, 0, VIDEO_SIZE, VIDEO_SIZE);
+  var current = ctx.getImageData(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
   if (!previousFrameData) {
     previousFrameData = current.data.slice();
     return true;
@@ -768,10 +855,10 @@ function hasFrameChanged(ctx) {
 // Proximity Estimation — analyze frame regions for nearby obstacles
 // ---------------------------------------------------------------------------
 function estimateProximity(ctx) {
-  var imgData = ctx.getImageData(0, 0, VIDEO_SIZE, VIDEO_SIZE);
+  var imgData = ctx.getImageData(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
   var data = imgData.data;
-  var third = Math.floor(VIDEO_SIZE / 3);
-  var rowBytes = VIDEO_SIZE * 4;
+  var third = Math.floor(VIDEO_HEIGHT / 3);
+  var rowBytes = VIDEO_WIDTH * 4;
 
   // Analyze bottom third (near objects / ground)
   var bottomEdgeCount = 0;
@@ -786,13 +873,13 @@ function estimateProximity(ctx) {
   // Analyze center region for large blocking objects
   var centerDarkCount = 0;
   var centerTotal = 0;
-  var centerXStart = Math.floor(VIDEO_SIZE * 0.25);
-  var centerXEnd = Math.floor(VIDEO_SIZE * 0.75);
+  var centerXStart = Math.floor(VIDEO_WIDTH * 0.25);
+  var centerXEnd = Math.floor(VIDEO_WIDTH * 0.75);
   var centerYStart = third;
   var centerYEnd = third * 2;
   for (var y = centerYStart; y < centerYEnd; y += 4) {
     for (var x = centerXStart; x < centerXEnd; x += 4) {
-      var idx = (y * VIDEO_SIZE + x) * 4;
+      var idx = (y * VIDEO_WIDTH + x) * 4;
       var brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
       centerTotal++;
       if (brightness < 60) centerDarkCount++;
@@ -817,13 +904,13 @@ function estimateProximity(ctx) {
 
 function startVideoCapture() {
   var ctx = canvas.getContext("2d");
-  canvas.width = VIDEO_SIZE;
-  canvas.height = VIDEO_SIZE;
+  canvas.width = VIDEO_WIDTH;
+  canvas.height = VIDEO_HEIGHT;
 
   videoTimer = setInterval(function () {
     if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-    ctx.drawImage(video, 0, 0, VIDEO_SIZE, VIDEO_SIZE);
+    ctx.drawImage(video, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
 
     // Frame diff: skip unchanged frames in navigation mode (save tokens)
     if (currentMode === "navigation" && !hasFrameChanged(ctx)) {
@@ -860,6 +947,14 @@ function startVideoCapture() {
       sensorData.orientation_bad = true;
     }
 
+    // Attach motion / step data
+    sensorData.steps_since_last = motionData.stepsSinceLast;
+    sensorData.total_steps = motionData.totalSteps;
+    sensorData.speed = motionData.speed;
+    sensorData.is_moving = motionData.isMoving;
+    // Reset per-frame step counter
+    motionData.stepsSinceLast = 0;
+
     // Optimized encoding: canvas.toDataURL instead of toBlob + FileReader
     var dataUrl = canvas.toDataURL("image/jpeg", VIDEO_QUALITY);
     var base64 = dataUrl.split(",")[1];
@@ -878,6 +973,7 @@ function stopSession() {
   reconnectAttempts = MAX_RECONNECT_ATTEMPTS; // Prevent reconnect during intentional stop
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   stopOrientationMonitor();
+  stopMotionMonitor();
   if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
   if (audioWorklet) { audioWorklet.disconnect(); audioWorklet = null; }
   if (audioContext) { audioContext.close(); audioContext = null; }
