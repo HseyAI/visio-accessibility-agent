@@ -83,7 +83,11 @@
       <div class="controls">
         <button class="btn btn-primary" id="startBtn" aria-label="Start Visio accessibility agent">Start Visio</button>
         <button class="btn btn-danger" id="stopBtn" disabled aria-label="Stop Visio">Stop</button>
+        <button class="btn btn-calibrate" id="calibrateBtn" aria-label="Calibrate phone holding angle">Calibrate</button>
       </div>
+
+      <!-- Calibration Toast -->
+      <div class="calibration-toast" id="calibrationToast" role="status" aria-live="polite"></div>
 
       <!-- Emergency SOS Button -->
       <button class="sos-btn" id="sosBtn" disabled aria-label="Emergency SOS - double tap to activate">

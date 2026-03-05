@@ -57,7 +57,7 @@ let lastUserSpeechTime = 0;        // Track when user last spoke
 // Frame diff state
 let previousFrameData = null;
 let framesSkipped = 0;
-const DIFF_THRESHOLD = 8; // RMS pixel difference threshold
+const DIFF_THRESHOLD = 5; // RMS pixel difference threshold (lowered for mobile sensitivity)
 
 // Orientation state
 let orientationBad = false;
@@ -69,6 +69,11 @@ let orientationHideTimer = null;
 let lastOrientation = { alpha: null, beta: null, gamma: null }; // latest gyroscope
 let prevHeading = null;        // previous compass heading for turn detection
 let headingDelta = 0;          // accumulated heading change between frames
+
+// Calibration state
+var calibratedBeta = localStorage.getItem("visio_calibrated_beta");
+calibratedBeta = calibratedBeta !== null ? parseFloat(calibratedBeta) : null;
+var CALIBRATION_RANGE = 25; // degrees above/below calibrated angle considered "good"
 
 // Motion / accelerometer state
 let motionData = {
@@ -102,6 +107,8 @@ const modeButtons = document.querySelectorAll(".mode-btn");
 const orientationBar = document.getElementById("orientationBar");
 const orientationIcon = document.getElementById("orientationIcon");
 const orientationText = document.getElementById("orientationText");
+const calibrateBtn = document.getElementById("calibrateBtn");
+const calibrationToast = document.getElementById("calibrationToast");
 
 // ---------------------------------------------------------------------------
 // Status & UI helpers
@@ -256,12 +263,18 @@ function classifyOrientation(beta, gamma, readings) {
     }
   }
 
-  // Check tilt angles
+  // Check tilt angles — use calibrated range if available, else hardcoded 20-130
   if (beta !== null) {
-    if (beta > 130) {
+    var betaLow = 20;
+    var betaHigh = 130;
+    if (calibratedBeta !== null) {
+      betaLow = calibratedBeta - CALIBRATION_RANGE;
+      betaHigh = calibratedBeta + CALIBRATION_RANGE;
+    }
+    if (beta > betaHigh) {
       return { bad: true, message: "Raise your phone up", icon: "\u2B06\uFE0F" };
     }
-    if (beta < 20) {
+    if (beta < betaLow) {
       return { bad: true, message: "Lower your phone", icon: "\u2B07\uFE0F" };
     }
   }
@@ -847,8 +860,12 @@ function hasFrameChanged(ctx) {
     samples++;
   }
   var rms = diff / samples;
-  previousFrameData = current.data.slice();
-  return rms > DIFF_THRESHOLD;
+  // Only update reference when frame IS sent — compare next frame against last SENT frame
+  if (rms > DIFF_THRESHOLD) {
+    previousFrameData = current.data.slice();
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -887,13 +904,13 @@ function estimateProximity(ctx) {
   }
   var centerDarkPercent = centerTotal > 0 ? centerDarkCount / centerTotal : 0;
 
-  var groundObstructed = bottomEdgeRatio > 0.3;
-  var centerBlocked = centerDarkPercent > 0.3;
+  // Raised thresholds significantly to reduce false positives on normal ground/shadows
+  var groundObstructed = bottomEdgeRatio > 0.55;
+  var centerBlocked = centerDarkPercent > 0.55;
 
+  // Only report "close" — model sees the video and judges distance itself
   var proximity = "clear";
   if (groundObstructed || centerBlocked) proximity = "close";
-  else if (bottomEdgeRatio > 0.15 || centerDarkPercent > 0.15) proximity = "medium";
-  else if (bottomEdgeRatio > 0.05) proximity = "far";
 
   return {
     ground_obstructed: groundObstructed,
@@ -947,6 +964,11 @@ function startVideoCapture() {
       sensorData.orientation_bad = true;
     }
 
+    // Include calibrated angle so model knows holding position
+    if (calibratedBeta !== null) {
+      sensorData.calibrated_angle = Math.round(calibratedBeta);
+    }
+
     // Attach motion / step data
     sensorData.steps_since_last = motionData.stepsSinceLast;
     sensorData.total_steps = motionData.totalSteps;
@@ -992,6 +1014,34 @@ function stopSession() {
   sosBtn.disabled = true;
   startBtn.disabled = false;
   stopBtn.disabled = true;
+}
+
+// ---------------------------------------------------------------------------
+// Phone Angle Calibration
+// ---------------------------------------------------------------------------
+function showCalibrationToast(message) {
+  calibrationToast.textContent = message;
+  calibrationToast.classList.add("visible");
+  setTimeout(function () {
+    calibrationToast.classList.remove("visible");
+  }, 3000);
+}
+
+calibrateBtn.addEventListener("click", function () {
+  if (lastOrientation.beta !== null) {
+    calibratedBeta = lastOrientation.beta;
+    localStorage.setItem("visio_calibrated_beta", calibratedBeta.toString());
+    showCalibrationToast("Calibrated! Angle saved: " + Math.round(calibratedBeta) + "\u00B0");
+  } else {
+    showCalibrationToast("No sensor data yet \u2014 start Visio first and try again");
+  }
+});
+
+// Show first-time calibration hint
+if (calibratedBeta === null) {
+  setTimeout(function () {
+    showCalibrationToast("Hold your phone how you normally would, then tap Calibrate");
+  }, 1500);
 }
 
 startBtn.addEventListener("click", startSession);
