@@ -9,12 +9,27 @@ const VIDEO_QUALITY = 0.5;
 
 // Mode-specific frame intervals (ms)
 const MODE_FRAME_INTERVALS = {
-  navigation: 1000,   // 1 FPS — Google recommended, ~258 tokens/frame
+  navigation: 1000,   // Base — overridden by adaptive rate when walking
   reading: 2000,      // Slower — text doesn't move
   exploration: 2000,  // Save tokens for longer sessions
 };
 
+// Speed-adaptive intervals for navigation mode (ms)
+const SPEED_FRAME_INTERVALS = {
+  stationary: 2000,   // Save tokens when not moving
+  slow: 750,          // ~1.3 FPS
+  moderate: 500,      // 2 FPS — walking speed
+  fast: 400,          // 2.5 FPS — brisk walk / jogging
+};
+
 let VIDEO_FRAME_INTERVAL = MODE_FRAME_INTERVALS.navigation;
+
+function getAdaptiveInterval() {
+  if (currentMode !== "navigation") {
+    return MODE_FRAME_INTERVALS[currentMode] || 2000;
+  }
+  return SPEED_FRAME_INTERVALS[motionData.speed] || 1000;
+}
 let currentMode = "navigation";
 
 // ---------------------------------------------------------------------------
@@ -63,6 +78,8 @@ const DIFF_THRESHOLD = 5; // RMS pixel difference threshold (lowered for mobile 
 let orientationBad = false;
 let orientationWarningActive = false;
 let lastOrientationWarnTime = 0;
+let lastOrientationWsSendTime = 0;
+const ORIENT_WS_COOLDOWN = 10000; // 10s cooldown for sending orientation to model
 let orientationReadings = [];  // rolling window of {beta, gamma, ts}
 let badOrientationStart = 0;   // when bad orientation was first detected
 let orientationHideTimer = null;
@@ -74,6 +91,11 @@ let headingDelta = 0;          // accumulated heading change between frames
 var calibratedBeta = localStorage.getItem("visio_calibrated_beta");
 calibratedBeta = calibratedBeta !== null ? parseFloat(calibratedBeta) : null;
 var CALIBRATION_RANGE = 25; // degrees above/below calibrated angle considered "good"
+
+// Auto-calibration state
+let autoCalibrationDone = false;
+let autoCalibrationReadings = [];
+let autoCalibrationStartTime = 0;
 
 // Motion / accelerometer state
 let motionData = {
@@ -107,7 +129,6 @@ const modeButtons = document.querySelectorAll(".mode-btn");
 const orientationBar = document.getElementById("orientationBar");
 const orientationIcon = document.getElementById("orientationIcon");
 const orientationText = document.getElementById("orientationText");
-const calibrateBtn = document.getElementById("calibrateBtn");
 const calibrationToast = document.getElementById("calibrationToast");
 
 // ---------------------------------------------------------------------------
@@ -204,9 +225,54 @@ function processAgentResponse(text) {
 // ---------------------------------------------------------------------------
 // Mode Switching
 // ---------------------------------------------------------------------------
+var lastModeSwitchTime = 0;
+
+function applyReadingFocus() {
+  if (!mediaStream) return;
+  var videoTrack = mediaStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+  try {
+    var caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
+    if (caps.focusMode && caps.focusMode.indexOf("continuous") !== -1) {
+      videoTrack.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(function () {});
+    }
+    if (caps.focusDistance) {
+      // Set near-range focus for reading nearby text
+      var nearFocus = (caps.focusDistance.min || 0) + 0.1;
+      videoTrack.applyConstraints({ advanced: [{ focusDistance: nearFocus }] }).catch(function () {});
+    }
+  } catch (e) {
+    // Graceful degradation — focusMode not supported on this device
+  }
+}
+
+function resetFocus() {
+  if (!mediaStream) return;
+  var videoTrack = mediaStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+  try {
+    var caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
+    if (caps.focusMode && caps.focusMode.indexOf("continuous") !== -1) {
+      videoTrack.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(function () {});
+    }
+  } catch (e) {}
+}
+
 function switchMode(mode) {
   currentMode = mode;
   VIDEO_FRAME_INTERVAL = MODE_FRAME_INTERVALS[mode];
+
+  // Reset frame diff so first frame after switch always sends
+  previousFrameData = null;
+  framesSkipped = 0;
+
+  // Apply focus mode: near-range for reading, continuous for others
+  if (mode === "reading") {
+    applyReadingFocus();
+  } else {
+    resetFocus();
+  }
+
   modeBadge.textContent = mode.toUpperCase();
 
   // Update button states
@@ -218,7 +284,8 @@ function switchMode(mode) {
 
   // Restart video capture with new interval
   if (isRunning && videoTimer) {
-    clearInterval(videoTimer);
+    clearTimeout(videoTimer);
+    videoTimer = null;
     startVideoCapture();
   }
 
@@ -229,7 +296,11 @@ function switchMode(mode) {
 }
 
 modeButtons.forEach(function (btn) {
-  btn.addEventListener("click", function () { switchMode(btn.dataset.mode); });
+  btn.addEventListener("click", function () {
+    if (Date.now() - lastModeSwitchTime < 1000) return;
+    lastModeSwitchTime = Date.now();
+    switchMode(btn.dataset.mode);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -252,6 +323,11 @@ var ORIENT_COOLDOWN = 5000;           // ms cooldown between warnings
 var ORIENT_SHAKE_VARIANCE = 400;      // variance threshold for shake detection
 
 function classifyOrientation(beta, gamma, readings) {
+  // Suppress orientation warnings during auto-calibration period (first 5s)
+  if (!autoCalibrationDone) {
+    return { bad: false, message: "Setting up...", icon: "\uD83D\uDCF1" };
+  }
+
   // Check shake first — variance of recent readings
   if (readings.length >= 3) {
     var betaValues = readings.map(function (r) { return r.beta; });
@@ -283,7 +359,7 @@ function classifyOrientation(beta, gamma, readings) {
     return { bad: true, message: "Straighten your phone", icon: "\u21C6" };
   }
 
-  return { bad: false, message: "Phone position: Good", icon: "\uD83D\uDCF1" };
+  return { bad: false, message: "Steady", icon: "\uD83D\uDCF1" };
 }
 
 function variance(arr) {
@@ -297,6 +373,16 @@ function showOrientationWarning(message, icon) {
   orientationText.textContent = message;
   orientationBar.className = "orientation-bar visible warning";
   if (orientationHideTimer) clearTimeout(orientationHideTimer);
+
+  // Send to model so it speaks the correction (blind user can't see visual bar)
+  var now = Date.now();
+  if (ws && ws.readyState === WebSocket.OPEN && now - lastOrientationWsSendTime > ORIENT_WS_COOLDOWN) {
+    lastOrientationWsSendTime = now;
+    ws.send(JSON.stringify({
+      type: "text",
+      data: "[PHONE POSITION] " + message + ". Hold your phone upright in front of you."
+    }));
+  }
 }
 
 function hideOrientationWarning() {
@@ -316,6 +402,20 @@ function handleOrientationEvent(event) {
   var gamma = event.gamma; // left/right tilt (-90 to 90)
 
   if (beta === null && gamma === null) return;
+
+  // Auto-calibration: collect first 5 seconds of beta readings
+  if (!autoCalibrationDone && beta !== null) {
+    if (autoCalibrationStartTime === 0) autoCalibrationStartTime = now;
+    autoCalibrationReadings.push(beta);
+    var elapsed = now - autoCalibrationStartTime;
+    if (elapsed >= 5000 || autoCalibrationReadings.length >= 25) {
+      var sum = autoCalibrationReadings.reduce(function (a, b) { return a + b; }, 0);
+      calibratedBeta = sum / autoCalibrationReadings.length;
+      localStorage.setItem("visio_calibrated_beta", calibratedBeta.toString());
+      showCalibrationToast("Position locked. You're all set.");
+      autoCalibrationDone = true;
+    }
+  }
 
   // Store latest orientation for frame metadata
   lastOrientation = { alpha: alpha, beta: beta, gamma: gamma };
@@ -655,6 +755,7 @@ async function startSession() {
         facingMode: "environment",
         width: { ideal: 1280 },
         height: { ideal: 720 },
+        focusMode: { ideal: "continuous" },
       },
     });
 
@@ -699,6 +800,10 @@ async function startSession() {
       isRunning = true;
       framesSent = 0;
       framesSuccess = 0;
+      // Reset auto-calibration so it re-calibrates each session
+      autoCalibrationDone = false;
+      autoCalibrationReadings = [];
+      autoCalibrationStartTime = 0;
       setStatus("connected", "Connected - Visio is watching and listening");
       startBtn.disabled = true;
       stopBtn.disabled = false;
@@ -813,7 +918,7 @@ function handleWsClose() {
       setStatus("", "Connection lost — reconnecting (" + reconnectAttempts + "/" + MAX_RECONNECT_ATTEMPTS + ")...");
       addTranscript("Connection lost. Reconnecting...", "agent");
 
-      if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+      if (videoTimer) { clearTimeout(videoTimer); videoTimer = null; }
       if (audioWorklet) { audioWorklet.disconnect(); audioWorklet = null; }
       if (audioContext) { audioContext.close(); audioContext = null; }
 
@@ -904,17 +1009,30 @@ function estimateProximity(ctx) {
   }
   var centerDarkPercent = centerTotal > 0 ? centerDarkCount / centerTotal : 0;
 
-  // Raised thresholds significantly to reduce false positives on normal ground/shadows
-  var groundObstructed = bottomEdgeRatio > 0.55;
-  var centerBlocked = centerDarkPercent > 0.55;
+  // Lowered thresholds to catch ground-level hazards (posts, bricks, pits)
+  var groundObstructed = bottomEdgeRatio > 0.35;
+  var centerBlocked = centerDarkPercent > 0.45;
+
+  // Near-ground region: bottom quarter of frame for close trip hazards
+  var nearGroundEdgeCount = 0;
+  var quarterY = Math.floor(VIDEO_HEIGHT * 0.75);
+  var nearGroundStart = quarterY * rowBytes;
+  for (var j = nearGroundStart; j < data.length - rowBytes; j += 16) {
+    var nearDiff = Math.abs(data[j] - data[j + rowBytes]);
+    if (nearDiff > 30) nearGroundEdgeCount++;
+  }
+  var nearGroundTotal = (data.length - nearGroundStart) / 16;
+  var nearGroundEdgeRatio = nearGroundTotal > 0 ? nearGroundEdgeCount / nearGroundTotal : 0;
+  var nearGroundHazard = nearGroundEdgeRatio > 0.30;
 
   // Only report "close" — model sees the video and judges distance itself
   var proximity = "clear";
-  if (groundObstructed || centerBlocked) proximity = "close";
+  if (groundObstructed || centerBlocked || nearGroundHazard) proximity = "close";
 
   return {
     ground_obstructed: groundObstructed,
     center_blocked: centerBlocked,
+    near_ground_hazard: nearGroundHazard,
     proximity: proximity,
   };
 }
@@ -924,68 +1042,80 @@ function startVideoCapture() {
   canvas.width = VIDEO_WIDTH;
   canvas.height = VIDEO_HEIGHT;
 
-  videoTimer = setInterval(function () {
-    if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-    ctx.drawImage(video, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
-
-    // Frame diff: skip unchanged frames in navigation mode (save tokens)
-    if (currentMode === "navigation" && !hasFrameChanged(ctx)) {
-      framesSkipped++;
+  function captureFrame() {
+    if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) {
+      videoTimer = null;
       return;
     }
 
-    framesSent++;
+    ctx.drawImage(video, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
 
-    // Capture sensor snapshot for this frame
-    var sensorData = null;
-    if (lastOrientation.beta !== null) {
-      var turnDir = "steady";
-      if (headingDelta > 15) turnDir = "turning right";
-      else if (headingDelta < -15) turnDir = "turning left";
-      sensorData = {
-        heading: lastOrientation.alpha !== null ? Math.round(lastOrientation.alpha) : null,
-        tilt: Math.round(lastOrientation.beta),
-        lean: Math.round(lastOrientation.gamma),
-        turn: turnDir,
-      };
-      headingDelta = 0; // Reset for next frame interval
+    // Frame diff: skip unchanged frames in navigation mode when stationary (save tokens)
+    // When walking, always send every frame so model stays responsive
+    var skipFrame = currentMode === "navigation" && !motionData.isMoving && !hasFrameChanged(ctx);
+    if (skipFrame) {
+      framesSkipped++;
+    } else {
+      framesSent++;
+
+      // Capture sensor snapshot for this frame
+      var sensorData = null;
+      if (lastOrientation.beta !== null) {
+        var turnDir = "steady";
+        if (headingDelta > 15) turnDir = "turning right";
+        else if (headingDelta < -15) turnDir = "turning left";
+        sensorData = {
+          heading: lastOrientation.alpha !== null ? Math.round(lastOrientation.alpha) : null,
+          tilt: Math.round(lastOrientation.beta),
+          lean: Math.round(lastOrientation.gamma),
+          turn: turnDir,
+        };
+        headingDelta = 0; // Reset for next frame interval
+      }
+
+      // Add proximity estimation
+      var proximity = estimateProximity(ctx);
+      if (!sensorData) sensorData = {};
+      sensorData.proximity = proximity.proximity;
+      sensorData.ground_obstructed = proximity.ground_obstructed;
+      sensorData.center_blocked = proximity.center_blocked;
+      sensorData.near_ground_hazard = proximity.near_ground_hazard;
+
+      // Tag bad orientation instead of skipping frame entirely
+      if (orientationBad) {
+        sensorData.orientation_bad = true;
+      }
+
+      // Include calibrated angle so model knows holding position
+      if (calibratedBeta !== null) {
+        sensorData.calibrated_angle = Math.round(calibratedBeta);
+      }
+
+      // Attach motion / step data
+      sensorData.steps_since_last = motionData.stepsSinceLast;
+      sensorData.total_steps = motionData.totalSteps;
+      sensorData.speed = motionData.speed;
+      sensorData.is_moving = motionData.isMoving;
+      // Reset per-frame step counter
+      motionData.stepsSinceLast = 0;
+
+      // Optimized encoding: canvas.toDataURL instead of toBlob + FileReader
+      var dataUrl = canvas.toDataURL("image/jpeg", VIDEO_QUALITY);
+      var base64 = dataUrl.split(",")[1];
+      var msg = { type: "image", data: base64, frame: framesSent };
+      msg.sensors = sensorData;
+      ws.send(JSON.stringify(msg));
+      framesSuccess++;
+      updateConnectionQuality();
     }
 
-    // Add proximity estimation
-    var proximity = estimateProximity(ctx);
-    if (!sensorData) sensorData = {};
-    sensorData.proximity = proximity.proximity;
-    sensorData.ground_obstructed = proximity.ground_obstructed;
-    sensorData.center_blocked = proximity.center_blocked;
+    // Schedule next frame with adaptive interval based on speed
+    var nextInterval = getAdaptiveInterval();
+    videoTimer = setTimeout(captureFrame, nextInterval);
+  }
 
-    // Tag bad orientation instead of skipping frame entirely
-    if (orientationBad) {
-      sensorData.orientation_bad = true;
-    }
-
-    // Include calibrated angle so model knows holding position
-    if (calibratedBeta !== null) {
-      sensorData.calibrated_angle = Math.round(calibratedBeta);
-    }
-
-    // Attach motion / step data
-    sensorData.steps_since_last = motionData.stepsSinceLast;
-    sensorData.total_steps = motionData.totalSteps;
-    sensorData.speed = motionData.speed;
-    sensorData.is_moving = motionData.isMoving;
-    // Reset per-frame step counter
-    motionData.stepsSinceLast = 0;
-
-    // Optimized encoding: canvas.toDataURL instead of toBlob + FileReader
-    var dataUrl = canvas.toDataURL("image/jpeg", VIDEO_QUALITY);
-    var base64 = dataUrl.split(",")[1];
-    var msg = { type: "image", data: base64, frame: framesSent };
-    msg.sensors = sensorData;
-    ws.send(JSON.stringify(msg));
-    framesSuccess++;
-    updateConnectionQuality();
-  }, VIDEO_FRAME_INTERVAL);
+  // Start the adaptive capture loop
+  videoTimer = setTimeout(captureFrame, getAdaptiveInterval());
 }
 
 function stopSession() {
@@ -996,7 +1126,7 @@ function stopSession() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   stopOrientationMonitor();
   stopMotionMonitor();
-  if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+  if (videoTimer) { clearTimeout(videoTimer); videoTimer = null; }
   if (audioWorklet) { audioWorklet.disconnect(); audioWorklet = null; }
   if (audioContext) { audioContext.close(); audioContext = null; }
   if (playerNode) { playerNode.port.postMessage({ command: "stop" }); }
@@ -1025,23 +1155,6 @@ function showCalibrationToast(message) {
   setTimeout(function () {
     calibrationToast.classList.remove("visible");
   }, 3000);
-}
-
-calibrateBtn.addEventListener("click", function () {
-  if (lastOrientation.beta !== null) {
-    calibratedBeta = lastOrientation.beta;
-    localStorage.setItem("visio_calibrated_beta", calibratedBeta.toString());
-    showCalibrationToast("Calibrated! Angle saved: " + Math.round(calibratedBeta) + "\u00B0");
-  } else {
-    showCalibrationToast("No sensor data yet \u2014 start Visio first and try again");
-  }
-});
-
-// Show first-time calibration hint
-if (calibratedBeta === null) {
-  setTimeout(function () {
-    showCalibrationToast("Hold your phone how you normally would, then tap Calibrate");
-  }, 1500);
 }
 
 startBtn.addEventListener("click", startSession);

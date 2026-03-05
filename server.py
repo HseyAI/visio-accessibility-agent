@@ -63,6 +63,7 @@ OBSTACLE_KEYWORDS = [
     "wall", "fence", "barrier", "bollard", "cone", "construction",
     "stairs", "steps", "curb", "pothole", "hole", "crack",
     "door", "gate", "pillar", "column", "box", "bin", "trash",
+    "slope", "ramp", "curb edge", "uneven", "gravel", "drop", "elevation",
 ]
 
 def create_object_memory():
@@ -71,6 +72,7 @@ def create_object_memory():
         "last_obstacles": [],        # [{name, side, frame_num, timestamp}]
         "last_clear_frame": 0,       # frame when scene was last fully clear
         "consecutive_clear": 0,      # count of consecutive clear responses
+        "last_obstacle_cleared_frame": 0,  # frame when last obstacle was cleared
     }
 
 def parse_obstacles_from_text(text, frame_num):
@@ -95,8 +97,8 @@ def parse_obstacles_from_text(text, frame_num):
 
 def check_obstacle_memory(obj_memory, model_text, frame_num):
     """
-    Check if model says 'clear' but we recently tracked close obstacles.
-    Returns a caution message or None.
+    Check if model says 'clear' or 'proceed' but we recently tracked close obstacles.
+    Returns a scan-ahead or caution message, or None.
     """
     lower = model_text.lower()
 
@@ -107,26 +109,31 @@ def check_obstacle_memory(obj_memory, model_text, frame_num):
         obj_memory["consecutive_clear"] = 0
         return None
 
-    # Check if model is saying it's clear
+    # Check if model is saying it's clear or telling user to proceed
     clear_phrases = ["clear", "no obstacle", "path is free", "nothing ahead", "all clear", "safe to"]
+    proceed_phrases = ["keep going", "proceed", "continue", "go ahead", "carry on", "you're past", "you've passed"]
     is_clear = any(phrase in lower for phrase in clear_phrases)
+    is_proceed = any(phrase in lower for phrase in proceed_phrases)
 
-    if not is_clear:
+    if not is_clear and not is_proceed:
         return None
 
-    # Model says clear — check memory for recent obstacles
+    # Model says clear/proceed — check memory for recent obstacles
     now = time.time()
     obj_memory["consecutive_clear"] += 1
 
-    # Only inject caution if obstacles were seen recently (<5s) and fewer than 5 consecutive clears
+    # Only inject if obstacles were seen recently (<5s) and fewer than 5 consecutive clears
     recent = [o for o in obj_memory["last_obstacles"] if now - o["timestamp"] < 5.0]
 
     if recent and obj_memory["consecutive_clear"] < 5:
         names = list(set(o["name"] for o in recent))
-        sides = list(set(o["side"] for o in recent))
-        age = round(now - recent[0]["timestamp"], 1)
-        caution = f"[CAUTION] You were approaching {', '.join(names)} on your {sides[0]} {age}s ago. It may still be near you. Proceed carefully."
-        return caution
+        obj_memory["last_obstacle_cleared_frame"] = frame_num
+
+        # First clear after obstacles — prompt to scan ahead
+        if obj_memory["consecutive_clear"] == 1:
+            return f"[SCAN AHEAD] You just cleared {', '.join(names)}. Scan for the NEXT obstacle. What's ahead NOW?"
+        else:
+            return f"[CAUTION] Recently passed {', '.join(names)}. What's NEXT in the path?"
 
     # After 5 consecutive clears, trust the model and flush memory
     if obj_memory["consecutive_clear"] >= 5:
@@ -228,11 +235,15 @@ async def websocket_endpoint(websocket: WebSocket):
     live_request_queue = LiveRequestQueue()
     running = True
     last_user_speech_time = 0.0  # Track when user last spoke
+    last_model_speech_time = time.time()  # Track when model last spoke
     last_proximity_alert_time = 0.0  # Cooldown for proximity alerts
     last_proximity_state = "clear"   # Track proximity changes
+    last_walking_update_time = 0.0   # Track walking-context prompt injection
+    last_turn_rescan_time = 0.0      # Track turn-triggered re-scans
+    session_stats["last_is_moving"] = False  # Track user movement from sensors
 
     async def upstream():
-        nonlocal running, last_user_speech_time, last_frame_num, last_proximity_alert_time, last_proximity_state
+        nonlocal running, last_user_speech_time, last_frame_num, last_proximity_alert_time, last_proximity_state, last_walking_update_time, last_turn_rescan_time
         try:
             while running:
                 msg = await websocket.receive()
@@ -282,7 +293,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                     last_proximity_alert_time = now
                                     ground = sensors.get("ground_obstructed", False)
                                     center = sensors.get("center_blocked", False)
+                                    near_ground = sensors.get("near_ground_hazard", False)
                                     hints = []
+                                    if near_ground:
+                                        hints.append("object close on ground — possible post, stone, or step")
                                     if ground:
                                         hints.append("ground obstruction detected")
                                     if center:
@@ -295,6 +309,31 @@ async def websocket_endpoint(websocket: WebSocket):
                                     )
                             if sensors:
                                 last_proximity_state = sensors.get("proximity", "clear")
+                                # Track movement state for silence monitor
+                                session_stats["last_is_moving"] = sensors.get("is_moving", False)
+
+                                # Turn-triggered re-scan: if user is turning, re-scan scene
+                                turn = sensors.get("turn", "steady")
+                                if turn != "steady" and now - last_turn_rescan_time > 2.0 and now - last_walking_update_time > 2.0:
+                                    last_turn_rescan_time = now
+                                    live_request_queue.send_content(
+                                        types.Content(parts=[types.Part(
+                                            text=f"[DIRECTION CHANGE] User is {turn}. Re-scan — what obstacles are now in their path?"
+                                        )])
+                                    )
+
+                            # Walking-context prompt: every 5s while user is walking in navigation mode
+                            now2 = time.time()
+                            if (session_stats.get("last_is_moving")
+                                    and session_stats["current_mode"] == "navigation"
+                                    and now2 - last_walking_update_time > 5.0
+                                    and now2 - last_user_speech_time > 3.0):
+                                last_walking_update_time = now2
+                                live_request_queue.send_content(
+                                    types.Content(parts=[types.Part(
+                                        text="[WALKING UPDATE] User is walking. Scan for NEW obstacles since last report. Steps, curbs, posts, vehicles, surface changes ahead? If you recently cleared an obstacle, what's NEXT? If clear, confirm briefly."
+                                    )])
+                                )
 
                         elif msg_type == "user_speech":
                             # Client signals user is speaking — pause nav prompts
@@ -314,6 +353,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             mode = data.get("data", "navigation")
                             session_stats["mode_switches"] += 1
                             session_stats["current_mode"] = mode
+                            # Reset obstacle memory on mode switch
+                            obj_memory["last_obstacles"] = []
+                            obj_memory["consecutive_clear"] = 0
                             logger.info(f"Mode switched to: {mode}")
                             if mode == "navigation":
                                 switch_text = "[MODE: NAVIGATION] Focus on path safety. What's in the user's path right now? Warn if obstacle, else confirm clear."
@@ -345,7 +387,7 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.error(f"Upstream error: {e}")
 
     async def downstream():
-        nonlocal running
+        nonlocal running, last_model_speech_time
         try:
             async for event in runner.run_live(
                 user_id=user_id,
@@ -366,10 +408,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             and "audio" in part.inline_data.mime_type
                         ):
                             session_stats["audio_chunks_received"] += 1
+                            last_model_speech_time = time.time()
                             await websocket.send_bytes(part.inline_data.data)
 
                         if part.text:
                             session_stats["transcripts_sent"] += 1
+                            last_model_speech_time = time.time()
                             # Distinguish user transcription from agent response
                             is_user = getattr(event, 'author', '') == 'user' or (
                                 event.content.role and event.content.role == 'user'
@@ -395,8 +439,33 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             logger.error(f"Downstream error: {e}")
 
+    async def silence_monitor():
+        """Nudge model if it goes silent while user is walking."""
+        nonlocal running
+        try:
+            while running:
+                await asyncio.sleep(2)
+                if not running:
+                    break
+                now = time.time()
+                silence_duration = now - last_model_speech_time
+                is_moving = session_stats.get("last_is_moving", False)
+                user_recently_spoke = (now - last_user_speech_time) < 3.0
+
+                if (silence_duration > 7.0
+                        and is_moving
+                        and not user_recently_spoke
+                        and session_stats["current_mode"] == "navigation"):
+                    live_request_queue.send_content(
+                        types.Content(parts=[types.Part(
+                            text='[HEARTBEAT] User is still walking. What\'s in their path? Give brief status — even just "clear ahead".'
+                        )])
+                    )
+        except Exception as e:
+            logger.error(f"Silence monitor error: {e}")
+
     try:
-        await asyncio.gather(upstream(), downstream(), return_exceptions=True)
+        await asyncio.gather(upstream(), downstream(), silence_monitor(), return_exceptions=True)
     finally:
         live_request_queue.close()
         duration = round(time.time() - session_start, 1)
